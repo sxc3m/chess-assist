@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chess Assist</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="brand">
+        <img class="brand__icon" src="../icons/icon-48.png" width="26" height="26" alt="">
+        <div class="brand__text">
+          <h1>Chess Assist</h1>
+          <p class="engine" id="engineLine">
+            <span class="dot" id="engineDot"></span>
+            <span id="engineText">Stockfish 19 NNUE</span>
+          </p>
+        </div>
+      </div>
+      <label class="switch" title="Включить или выключить расширение">
+        <input type="checkbox" role="switch" id="enabled">
+        <span class="switch__track"><span class="switch__thumb"></span></span>
+        <span class="visually-hidden">Расширение включено</span>
+      </label>
+    </header>
+
+    <div class="site" id="siteLine">
+      <span class="site__dot"></span>
+      <span id="siteText">Проверяю страницу…</span>
+    </div>
+
+    <section class="hero" aria-label="Текущая позиция">
+      <div class="hero__top">
+        <span class="overline">Лучший ход</span>
+        <span class="turn" id="turnBadge">—</span>
+      </div>
+      <div class="hero__main">
+        <span class="hero__move" id="bestMove">—</span>
+        <span class="hero__eval" id="eval">—</span>
+        <span class="depth" id="depthBadge"></span>
+      </div>
+      <p class="status" id="statusText">Открой доску на chess.com или lichess.org</p>
+      <p class="error hidden" id="errorText"></p>
+      <div class="actions">
+        <button type="button" class="btn btn--filled" id="playNow" disabled>
+          <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+          Сделать ход
+        </button>
+        <button type="button" class="btn btn--icon" id="recalc" disabled title="Пересчитать" aria-label="Пересчитать">
+          <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4c-4.42 0-7.99 3.58-8 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+        </button>
+        <button type="button" class="btn btn--icon" id="flipTurn" disabled title="Сменить ход" aria-label="Сменить ход">
+          <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>
+        </button>
+      </div>
+    </section>
+
+    <details class="group">
+      <summary>Конфиги</summary>
+      <div class="group__body">
+        <div class="config-presets">
+          <button type="button" class="btn btn--soft" id="presetBullet">Пуля 1+0</button>
+          <button type="button" class="btn btn--soft" id="presetTen">10 минут</button>
+          <button type="button" class="btn btn--soft" id="presetMax">Максимум</button>
+        </div>
+        <div class="config-row">
+          <button type="button" class="btn btn--soft" id="exportConfig">Экспорт в буфер</button>
+          <button type="button" class="btn btn--soft" id="importConfig">Импорт из буфера</button>
+        </div>
+        <p class="config-status" id="configStatus" role="status"></p>
+        <div class="config-paste is-hidden" id="configPaste">
+          <textarea id="configText" rows="5" spellcheck="false"
+            placeholder="Вставь сюда JSON-конфиг и нажми «Применить»"></textarea>
+          <button type="button" class="btn btn--filled" id="applyConfig">Применить</button>
+        </div>
+      </div>
+    </details>
+
+    <details class="group">
+      <summary>Отображение</summary>
+      <div class="group__body">
+        <div class="row row--master">
+          <span class="row__text">
+            <strong>Без интерфейса</strong>
+            <small>ничего не показывать на доске</small>
+          </span>
+          <label class="switch" title="Скрыть стрелку и панель оценки">
+            <input type="checkbox" role="switch" id="hideOverlay">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Без интерфейса</span>
+          </label>
+        </div>
+        <div class="row" data-ui-row>
+          <span class="row__text">Стрелка лучшего хода</span>
+          <label class="switch" title="Показывать стрелку на доске">
+            <input type="checkbox" role="switch" id="showArrow">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Стрелка лучшего хода</span>
+          </label>
+        </div>
+        <div class="row" data-ui-row>
+          <span class="row__text">
+            <strong>Ход соперника</strong>
+            <small>прогноз ответа, пока ждёшь</small>
+          </span>
+          <label class="switch" title="Показывать прогноз ответа соперника">
+            <input type="checkbox" role="switch" id="showOpponent">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Показывать ход соперника</span>
+          </label>
+        </div>
+        <div class="row" data-ui-row>
+          <span class="row__text">Панель оценки</span>
+          <label class="switch" title="Показывать панель с оценкой. Её можно перетащить по странице.">
+            <input type="checkbox" role="switch" id="showHud">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Панель оценки</span>
+          </label>
+        </div>
+      </div>
+    </details>
+
+    <details class="group">
+      <summary>Игра</summary>
+      <div class="group__body">
+        <div class="field">
+          <div class="field__label">
+            <span>Мой цвет</span>
+            <span class="hint">кто играет снизу</span>
+          </div>
+          <div class="segmented" id="sideGroup" role="group" aria-label="Мой цвет">
+            <button type="button" data-value="auto">Авто</button>
+            <button type="button" data-value="w">Белые</button>
+            <button type="button" data-value="b">Чёрные</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field__label">
+            <span>Чей ход сейчас</span>
+            <span class="hint">для текущей позиции</span>
+          </div>
+          <div class="segmented" id="turnGroup" role="group" aria-label="Чей ход сейчас">
+            <button type="button" data-value="auto">Авто</button>
+            <button type="button" data-value="w">Белые</button>
+            <button type="button" data-value="b">Чёрные</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field__label">
+            <span>Первый ход</span>
+            <span class="hint">если нет часов</span>
+          </div>
+          <div class="segmented" id="seedGroup" role="group" aria-label="Первый ход">
+            <button type="button" data-value="w">Белые</button>
+            <button type="button" data-value="b">Чёрные</button>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="group">
+      <summary>Движок</summary>
+      <div class="group__body">
+        <div class="field">
+          <div class="field__label">
+            <span>Сборка</span>
+            <span class="hint">сила / скорость запуска</span>
+          </div>
+          <div class="select-wrap">
+            <select class="select" id="engineBuild">
+              <option value="full">Stockfish 19 NNUE — максимум (95 МБ)</option>
+              <option value="lite">Stockfish 19 Lite — быстрый старт</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row row--auto">
+          <span class="row__text">
+            <strong>Автоход</strong>
+            <small>играть лучший ход автоматически</small>
+          </span>
+          <label class="switch" title="Играть лучший ход автоматически">
+            <input type="checkbox" role="switch" id="autoPlay">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Автоход</span>
+          </label>
+        </div>
+
+        <div class="sub is-hidden" id="autoOptions">
+          <div class="field__label">
+            <label for="autoDelay">Задержка перед ходом</label>
+            <output id="delayOut" for="autoDelay">0,7 с</output>
+          </div>
+          <input type="range" class="range" id="autoDelay" min="150" max="3000" step="50" value="700">
+        </div>
+
+        <div class="field field--slider">
+          <div class="field__label">
+            <label for="movetime">Время поиска</label>
+            <output id="movetimeOut" for="movetime">1,2 с</output>
+          </div>
+          <input type="range" class="range" id="movetime" min="300" max="30000" step="100" value="1200">
+        </div>
+
+        <div class="field">
+          <div class="field__label">
+            <label for="multiPV">Линий анализа</label>
+          </div>
+          <div class="select-wrap">
+            <select class="select" id="multiPV">
+              <option value="1">1 линия</option>
+              <option value="2">2 линии</option>
+              <option value="3">3 линии</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field field--slider">
+          <div class="field__label">
+            <label for="engineSkill">Skill Level</label>
+            <output id="engineSkillOut" for="engineSkill">20</output>
+          </div>
+          <input type="range" class="range" id="engineSkill" min="0" max="20" step="1" value="20">
+        </div>
+
+        <div class="field field--slider">
+          <div class="field__label">
+            <label for="engineDepth">Потолок глубины</label>
+            <output id="engineDepthOut" for="engineDepth">без лимита</output>
+          </div>
+          <input type="range" class="range" id="engineDepth" min="0" max="40" step="1" value="0">
+        </div>
+      </div>
+    </details>
+
+    <details class="group">
+      <summary>Очеловечивание ходов</summary>
+      <div class="group__body">
+        <div class="row row--master">
+          <span class="row__text">
+            <strong>Включить</strong>
+            <small>не всегда первый ход и живое время</small>
+          </span>
+          <label class="switch" title="Иногда играть почти лучший ход и думать по-разному">
+            <input type="checkbox" role="switch" id="humanize">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Очеловечивание ходов</span>
+          </label>
+        </div>
+
+        <div class="sub is-hidden" id="humanOptions">
+          <div class="row">
+            <span class="row__text">
+              <strong>Подстраиваться под рейтинг</strong>
+              <small>брать рейтинг с сайта и играть в его рамках</small>
+            </span>
+            <label class="switch" title="Читать рейтинги соперника и аккаунта с доски и подбирать силу">
+              <input type="checkbox" role="switch" id="humanizeAdaptive">
+              <span class="switch__track"><span class="switch__thumb"></span></span>
+              <span class="visually-hidden">Подстраиваться под рейтинг</span>
+            </label>
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeRating">Свой рейтинг</label>
+              <output id="humanizeRatingOut" for="humanizeRating">авто</output>
+            </div>
+            <input type="range" class="range" id="humanizeRating" min="0" max="3000" step="50" value="0">
+          </div>
+
+          <div class="row">
+            <span class="row__text">
+              <strong>Спасательная подушка</strong>
+              <small>при явном минусе играть в полную силу, пока не выровняется</small>
+            </span>
+            <label class="switch" title="Включать полную силу движка, когда позиция проиграна">
+              <input type="checkbox" role="switch" id="humanizeRescue">
+              <span class="switch__track"><span class="switch__thumb"></span></span>
+              <span class="visually-hidden">Спасательная подушка</span>
+            </label>
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeRescueCp">Порог включения</label>
+              <output id="humanizeRescueCpOut" for="humanizeRescueCp">-2.5</output>
+            </div>
+            <input type="range" class="range" id="humanizeRescueCp" min="100" max="1500" step="50" value="250">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeRescueExitCp">Выход при</label>
+              <output id="humanizeRescueExitCpOut" for="humanizeRescueExitCp">-0.4</output>
+            </div>
+            <input type="range" class="range" id="humanizeRescueExitCp" min="0" max="500" step="25" value="40">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeRescueMs">Спасение: время поиска</label>
+              <output id="humanizeRescueMsOut" for="humanizeRescueMs">0,9 с</output>
+            </div>
+            <input type="range" class="range" id="humanizeRescueMs" min="300" max="5000" step="100" value="900">
+          </div>
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeErrorPct">Процент ошибок</label>
+              <output id="humanizeErrorPctOut" for="humanizeErrorPct">25 %</output>
+            </div>
+            <input type="range" class="range" id="humanizeErrorPct" min="0" max="100" step="1" value="25">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeMaxLossCp">Бюджет потери, ср</label>
+              <output id="humanizeMaxLossCpOut" for="humanizeMaxLossCp">45 ср</output>
+            </div>
+            <input type="range" class="range" id="humanizeMaxLossCp" min="20" max="500" step="10" value="45">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeBlunderPct">Шанс зевка</label>
+              <output id="humanizeBlunderPctOut" for="humanizeBlunderPct">0 %</output>
+            </div>
+            <input type="range" class="range" id="humanizeBlunderPct" min="0" max="40" step="1" value="0">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeMin">Думать минимум</label>
+              <output id="humanizeMinOut" for="humanizeMin">5 с</output>
+            </div>
+            <input type="range" class="range" id="humanizeMin" min="500" max="30000" step="100" value="5000">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeMax">Думать обычно до</label>
+              <output id="humanizeMaxOut" for="humanizeMax">25 с</output>
+            </div>
+            <input type="range" class="range" id="humanizeMax" min="1000" max="60000" step="100" value="25000">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeFastPct">Шанс быстрого хода</label>
+              <output id="humanizeFastPctOut" for="humanizeFastPct">15 %</output>
+            </div>
+            <input type="range" class="range" id="humanizeFastPct" min="0" max="70" step="1" value="15">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeFastMs">Быстрый ход до</label>
+              <output id="humanizeFastMsOut" for="humanizeFastMs">3 с</output>
+            </div>
+            <input type="range" class="range" id="humanizeFastMs" min="500" max="8000" step="100" value="3000">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeRarePct">Шанс долгого хода</label>
+              <output id="humanizeRarePctOut" for="humanizeRarePct">8 %</output>
+            </div>
+            <input type="range" class="range" id="humanizeRarePct" min="0" max="40" step="1" value="8">
+          </div>
+
+          <div class="field field--slider">
+            <div class="field__label">
+              <label for="humanizeRare">Долгий ход до</label>
+              <output id="humanizeRareOut" for="humanizeRare">40 с</output>
+            </div>
+            <input type="range" class="range" id="humanizeRare" min="2000" max="90000" step="500" value="40000">
+          </div>
+
+          <div class="row">
+            <span class="row__text">
+              <strong>Смотреть на часы</strong>
+              <small>оставлять запас и не попадать на флаг</small>
+            </span>
+            <label class="switch" title="Сокращать время на ход, когда часы на исходе">
+              <input type="checkbox" role="switch" id="humanizeClockAware">
+              <span class="switch__track"><span class="switch__thumb"></span></span>
+              <span class="visually-hidden">Учитывать часы</span>
+            </label>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <p class="notice">
+      <svg class="notice__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 17h2v-6h-2v6zm1-15C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zM11 9h2V7h-2v2z"/></svg>
+      <span>Подсказки и автоход — против правил рейтинговых партий.</span>
+    </p>
+
+    <footer class="footer">
+      <span>Stockfish 19 · WASM</span>
+      <span id="version">v0.2.0</span>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

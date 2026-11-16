@@ -1,0 +1,4 @@
+# Build artifacts: the packages are published as release assets, not committed.
+dist/
+node_modules/
+*.log
