@@ -62,6 +62,8 @@
       <div class="group__body">
         <div class="config-presets">
           <button type="button" class="btn btn--soft" id="presetBullet">Пуля 1+0</button>
+          <button type="button" class="btn btn--soft" id="presetMaster">Мастер 2700</button>
+          <button type="button" class="btn btn--soft" id="presetBlitz">Блиц 3+0</button>
           <button type="button" class="btn btn--soft" id="presetTen">10 минут</button>
           <button type="button" class="btn btn--soft" id="presetMax">Максимум</button>
         </div>
@@ -196,6 +198,42 @@
             <output id="delayOut" for="autoDelay">0,7 с</output>
           </div>
           <input type="range" class="range" id="autoDelay" min="150" max="3000" step="50" value="700">
+        </div>
+
+        <div class="row row--auto">
+          <span class="row__text">
+            <strong>Авто «Новая …»</strong>
+            <small>жать кнопку в окне результата на любом контроле — 1, 3, 10 минут, с добавлением; и после победы, и после поражения</small>
+          </span>
+          <label class="switch" title="Начинать новую партию автоматически после окончания предыдущей, на том же контроле">
+            <input type="checkbox" role="switch" id="autoRematch">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Авто «Новая …»</span>
+          </label>
+        </div>
+
+        <div class="row row--auto">
+          <span class="row__text">
+            <strong>Ход как из интерфейса</strong>
+            <small>слать ход событиями по доске, а не внутренним вызовом сайта: на 0,1–0,2 с медленнее, зато ход идёт оттуда же, откуда человеческий</small>
+          </span>
+          <label class="switch" title="Ходить pointer-событиями по клеткам вместо вызова игрового объекта сайта">
+            <input type="checkbox" role="switch" id="humanInput">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Ход как из интерфейса</span>
+          </label>
+        </div>
+
+        <div class="row row--auto">
+          <span class="row__text">
+            <strong>Таблицы эндшпиля</strong>
+            <small>7 фигур и меньше: точный ход из базы Lichess вместо оценки движка. Работает и на телефоне, и на ПК — нужен только интернет, который в партии и так есть. Включается пресетом «Максимум».</small>
+          </span>
+          <label class="switch" title="Спрашивать таблицы Lichess в позициях с семью фигурами и меньше">
+            <input type="checkbox" role="switch" id="tablebase">
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="visually-hidden">Таблицы эндшпиля</span>
+          </label>
         </div>
 
         <div class="field field--slider">
@@ -337,7 +375,7 @@
               <label for="humanizeMin">Думать минимум</label>
               <output id="humanizeMinOut" for="humanizeMin">5 с</output>
             </div>
-            <input type="range" class="range" id="humanizeMin" min="500" max="30000" step="100" value="5000">
+            <input type="range" class="range" id="humanizeMin" min="120" max="30000" step="10" value="5000">
           </div>
 
           <div class="field field--slider">
@@ -345,7 +383,7 @@
               <label for="humanizeMax">Думать обычно до</label>
               <output id="humanizeMaxOut" for="humanizeMax">25 с</output>
             </div>
-            <input type="range" class="range" id="humanizeMax" min="1000" max="60000" step="100" value="25000">
+            <input type="range" class="range" id="humanizeMax" min="200" max="60000" step="10" value="25000">
           </div>
 
           <div class="field field--slider">
@@ -361,7 +399,7 @@
               <label for="humanizeFastMs">Быстрый ход до</label>
               <output id="humanizeFastMsOut" for="humanizeFastMs">3 с</output>
             </div>
-            <input type="range" class="range" id="humanizeFastMs" min="500" max="8000" step="100" value="3000">
+            <input type="range" class="range" id="humanizeFastMs" min="120" max="8000" step="10" value="3000">
           </div>
 
           <div class="field field--slider">
@@ -377,7 +415,7 @@
               <label for="humanizeRare">Долгий ход до</label>
               <output id="humanizeRareOut" for="humanizeRare">40 с</output>
             </div>
-            <input type="range" class="range" id="humanizeRare" min="2000" max="90000" step="500" value="40000">
+            <input type="range" class="range" id="humanizeRare" min="300" max="90000" step="10" value="40000">
           </div>
 
           <div class="row">

@@ -36,7 +36,10 @@
     humanizeFastPct: 15,
     humanizeFastMs: 3000,
     humanizeClockAware: true,
-    engineBuild: 'full'
+    engineBuild: 'full',
+    autoRematch: false,
+    humanInput: false,
+    tablebase: false
   };
 
   var settings = Object.assign({}, DEFAULTS);
@@ -153,6 +156,9 @@
     $('showHud').checked = !!settings.showHud;
     $('showOpponent').checked = !!settings.showOpponent;
     $('autoPlay').checked = !!settings.autoPlay;
+    $('autoRematch').checked = !!settings.autoRematch;
+    $('humanInput').checked = !!settings.humanInput;
+    $('tablebase').checked = !!settings.tablebase;
 
     var uiRows = document.querySelectorAll('[data-ui-row]');
     for (var i = 0; i < uiRows.length; i++) {
@@ -284,12 +290,12 @@
     humanizeRescueCp: [100, 1500],
     humanizeRescueExitCp: [0, 500],
     humanizeRescueMs: [300, 5000],
-    humanizeMinMs: [500, 30000],
-    humanizeMaxMs: [1000, 60000],
-    humanizeRareMs: [2000, 90000],
+    humanizeMinMs: [120, 30000],
+    humanizeMaxMs: [200, 60000],
+    humanizeRareMs: [300, 90000],
     humanizeRarePct: [0, 40],
     humanizeFastPct: [0, 70],
-    humanizeFastMs: [500, 8000]
+    humanizeFastMs: [120, 8000]
   };
 
   var ENUMS = {
@@ -324,33 +330,86 @@
         enabled: true,
         side: 'auto',
         seedTurn: 'w',
-        showOpponent: true,
         showArrow: true,
         showHud: true,
         hideOverlay: false,
         autoPlay: true,
-        autoPlayDelayMs: 450,
+        autoPlayDelayMs: 250,
+        // No forecast while the opponent thinks. It would keep the engine busy
+        // for seconds and force a stop-and-go handshake right before our own
+        // move, which is exactly the latency a 1+0 game cannot pay.
+        showOpponent: false,
         multiPV: 1,
         movetimeMs: 300,
         engineSkill: 20,
-        engineDepth: 4,
+        // Search deep enough to see a two-move tactic, no deeper: the goal is
+        // not to look like Stockfish, it is to stop walking into mates.
+        engineDepth: 6,
         humanize: true,
-        humanizeErrorPct: 62,
-        humanizeMaxLossCp: 320,
-        humanizeBlunderPct: 6,
+        // Frequency of mistakes follows the account's rating (adaptive below),
+        // while the size of any single slip is capped in content.js: a 320 cp
+        // error at bullet speed is a piece, and that is what ended in a
+        // suspension review.
+        humanizeErrorPct: 60,
+        humanizeMaxLossCp: 220,
+        humanizeBlunderPct: 4,
         humanizeAdaptive: true,
         humanizeRating: 0,
         humanizeRescue: true,
         humanizeRescueCp: 250,
         humanizeRescueExitCp: 40,
         humanizeRescueMs: 900,
-        humanizeMinMs: 500,
-        humanizeMaxMs: 1600,
-        humanizeRareMs: 3200,
-        humanizeRarePct: 2,
-        humanizeFastPct: 62,
-        humanizeFastMs: 600,
+        // Fast, but not a metronome: 0.15-1.0 s with half the moves in the
+        // first 0.4 s, and a 3% two-second think on a hard position. Constant
+        // sub-second taps on every move is its own pattern.
+        humanizeMinMs: 150,
+        humanizeMaxMs: 1000,
+        humanizeRareMs: 2000,
+        humanizeRarePct: 3,
+        humanizeFastPct: 50,
+        humanizeFastMs: 400,
         humanizeClockAware: true,
+        tablebase: false,
+        engineBuild: 'full'
+      }
+    },
+    blitz: {
+      label: 'Блиц 3+0',
+      settings: {
+        enabled: true,
+        side: 'auto',
+        seedTurn: 'w',
+        showArrow: true,
+        showHud: true,
+        hideOverlay: false,
+        autoPlay: true,
+        autoPlayDelayMs: 300,
+        showOpponent: false,
+        multiPV: 1,
+        movetimeMs: 900,
+        engineSkill: 20,
+        // 3+0 is the honest place for a high rating: there is time to search a
+        // position properly, and a 1-3 s pause is what a human actually takes.
+        // The depth comes from the profile table, which follows the account.
+        engineDepth: 10,
+        humanize: true,
+        humanizeErrorPct: 50,
+        humanizeMaxLossCp: 160,
+        humanizeBlunderPct: 2,
+        humanizeAdaptive: true,
+        humanizeRating: 0,
+        humanizeRescue: true,
+        humanizeRescueCp: 250,
+        humanizeRescueExitCp: 40,
+        humanizeRescueMs: 1200,
+        humanizeMinMs: 400,
+        humanizeMaxMs: 3500,
+        humanizeRareMs: 8000,
+        humanizeRarePct: 4,
+        humanizeFastPct: 40,
+        humanizeFastMs: 900,
+        humanizeClockAware: true,
+        tablebase: false,
         engineBuild: 'full'
       }
     },
@@ -387,6 +446,7 @@
         humanizeFastPct: 30,
         humanizeFastMs: 1500,
         humanizeClockAware: true,
+        tablebase: false,
         engineBuild: 'full'
       }
     },
@@ -396,14 +456,19 @@
         enabled: true,
         side: 'auto',
         seedTurn: 'w',
-        showOpponent: true,
+        showOpponent: false,
         showArrow: true,
         showHud: true,
         hideOverlay: false,
         autoPlay: true,
-        autoPlayDelayMs: 400,
+        autoPlayDelayMs: 150,
         multiPV: 1,
-        movetimeMs: 5000,
+        // The search time is not fixed any more: with humanization off the
+        // controller spends a sixtieth of the remaining clock per move (see
+        // requestAnalysis), so a 3+0 game searches seconds and a 1+0 game
+        // cannot flag. 300 is only the floor and the fallback when the clock
+        // cannot be read.
+        movetimeMs: 300,
         engineSkill: 20,
         engineDepth: 0,
         humanize: false,
@@ -423,6 +488,54 @@
         humanizeFastPct: 0,
         humanizeFastMs: 600,
         humanizeClockAware: true,
+        // The only preset that uses the endgame tables: perfect play from
+        // seven pieces down, which is exactly where a strong engine still
+        // gives away half-points by playing a "good" move instead of the exact
+        // one. Off everywhere else on purpose.
+        tablebase: true,
+        engineBuild: 'full'
+      }
+    },
+    master: {
+      label: 'Скрытый мастер 2700',
+      settings: {
+        enabled: true,
+        side: 'auto',
+        seedTurn: 'w',
+        showArrow: true,
+        showHud: true,
+        hideOverlay: false,
+        autoPlay: true,
+        autoPlayDelayMs: 250,
+        showOpponent: false,
+        multiPV: 1,
+        movetimeMs: 1200,
+        engineSkill: 20,
+        // Depth comes from the 2700 row of the profile table (12-13), so the
+        // search is capped instead of running to whatever the clock allows.
+        engineDepth: 0,
+        humanize: true,
+        humanizeErrorPct: 48,
+        humanizeMaxLossCp: 160,
+        humanizeBlunderPct: 1.5,
+        humanizeAdaptive: true,
+        // Manual anchor: the whole premise of this preset is playing at master
+        // level on a fresh account, so the site rating must not pull it down.
+        humanizeRating: 2700,
+        humanizeRescue: true,
+        humanizeRescueCp: 250,
+        humanizeRescueExitCp: 40,
+        humanizeRescueMs: 1200,
+        // A master in bullet thinks in tenths, but not uniformly: 0.3-2.4 s,
+        // with 5% of positions getting a real 3-6 s look.
+        humanizeMinMs: 300,
+        humanizeMaxMs: 2400,
+        humanizeRareMs: 6000,
+        humanizeRarePct: 5,
+        humanizeFastPct: 35,
+        humanizeFastMs: 700,
+        humanizeClockAware: true,
+        tablebase: false,
         engineBuild: 'full'
       }
     }
@@ -650,6 +763,15 @@
     $('autoPlay').addEventListener('change', function (event) {
       save({ autoPlay: !!event.target.checked });
     });
+    $('autoRematch').addEventListener('change', function (event) {
+      save({ autoRematch: !!event.target.checked });
+    });
+    $('humanInput').addEventListener('change', function (event) {
+      save({ humanInput: !!event.target.checked });
+    });
+    $('tablebase').addEventListener('change', function (event) {
+      save({ tablebase: !!event.target.checked });
+    });
 
     $('autoDelay').addEventListener('input', function (event) {
       updateRangeFill(event.target);
@@ -815,6 +937,8 @@
     });
 
     $('presetBullet').addEventListener('click', function () { applyPreset('bullet'); });
+    $('presetMaster').addEventListener('click', function () { applyPreset('master'); });
+    $('presetBlitz').addEventListener('click', function () { applyPreset('blitz'); });
     $('presetTen').addEventListener('click', function () { applyPreset('ten'); });
     $('presetMax').addEventListener('click', function () { applyPreset('max'); });
     $('exportConfig').addEventListener('click', exportConfig);
@@ -906,6 +1030,10 @@
     // falling back after a failed full load must be visible here.
     var label = status.engine || 'Stockfish';
     if (status.mobile) label += ' (телефон)';
+    // Above one, the root moves are split between independent engines working
+    // at the same time - there is no SharedArrayBuffer in a Firefox extension,
+    // so this is how far the parallelism goes.
+    if (status.parallel > 1) label += ' · ' + status.parallel + ' потока';
 
     if (error) {
       setText('engineText', label + ': ошибка');
@@ -944,6 +1072,9 @@
     if (contentState.targetRating) {
       text.textContent += ' · ~' + contentState.targetRating;
     }
+    if (contentState.phase) {
+      text.textContent += ' · ' + contentState.phase;
+    }
     line.classList.add('is-live');
   }
 
@@ -974,6 +1105,14 @@
     }
 
     var node = $('statusText');
+    if (state && state.tablebaseLast) {
+      // The chip carries the tablebase result for a fraction of a second in
+      // bullet, so the last exact decision is also kept here, where it stays.
+      status += ' · таблицы: ' + state.tablebaseLast.text;
+      if (state.tablebaseLast.count) {
+        status += ' (' + state.tablebaseLast.count + ')';
+      }
+    }
     node.textContent = status;
     node.className = 'status' + (tone ? ' ' + tone : '');
   }

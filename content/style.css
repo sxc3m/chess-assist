@@ -42,7 +42,7 @@
   align-items: center;
   gap: 7px;
   box-sizing: border-box;
-  width: 150px;
+  width: 214px;
   height: 28px;
   padding: 0 9px;
   overflow: hidden;
@@ -138,6 +138,24 @@
   white-space: nowrap;
 }
 
+/*
+ * The phase is the one label the user reads without looking for it, so it sits
+ * between the evaluation and the move: muted, small, never bold enough to
+ * compete with the move itself.
+ */
+.ca-hud__phase {
+  flex: 0 0 auto;
+  max-width: 74px;
+  overflow: hidden;
+  color: var(--ca-muted);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+
 .ca-hud__time {
   flex: 0 0 auto;
   min-width: 34px;
@@ -202,7 +220,7 @@
  */
 @media (max-width: 820px) {
   #ca-hud {
-    width: 168px;
+    width: 198px;
     height: 36px;
     min-height: 36px;
     padding: 0 11px;
@@ -219,6 +237,11 @@
   .ca-hud__time {
     min-width: 40px;
     font-size: 12px;
+  }
+
+  .ca-hud__phase {
+    max-width: 52px;
+    font-size: 11px;
   }
 
   .ca-hud__dot {

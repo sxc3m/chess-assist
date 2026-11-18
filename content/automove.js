@@ -257,7 +257,7 @@
         : 'Lichess не принял ход. Обнови вкладку и повтори.');
     }
 
-    if (opts.site === 'chess.com') {
+    if (opts.site === 'chess.com' && opts.input !== 'events') {
       var ccBridge = CA.PageBridge;
       if (ccBridge && typeof ccBridge.chesscomMove === 'function') {
         var ccResult = await ccBridge.chesscomMove(uci);

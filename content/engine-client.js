@@ -108,7 +108,9 @@
         multiPV: opts.multiPV || 1,
         movetime: opts.movetime || 1200,
         depth: opts.depth || 0,
-        skill: typeof opts.skill === 'number' ? opts.skill : 20
+        skill: typeof opts.skill === 'number' ? opts.skill : 20,
+        // Forwarded untouched: the background decides whether it can be split.
+        rootMoves: opts.rootMoves || null
       });
     } catch (e) {
       this.error = 'Нет связи с фоновым движком';

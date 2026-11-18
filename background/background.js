@@ -79,6 +79,25 @@
 
   var ports = new Set();
 
+  /*
+   * Root-split parallelism. Firefox never hands a WebExtension page a
+   * SharedArrayBuffer, and a pthread build of Stockfish cannot start without
+   * one, so "setoption name Threads" is unreachable here. What is reachable is
+   * several ordinary single-threaded workers, each given its own share of the
+   * root moves with "searchmoves", the highest score winning at the end. There
+   * is no shared hash and no cross-thread pruning, so the gain is a fraction of
+   * true SMP - but the work really is parallel, and it needs no preference, no
+   * rebuild and no phone-specific build.
+   */
+  var MAX_HELPERS = 3;
+  // A helper is only worth its memory when there is time to spend it. Below the
+  // spawn threshold the extra workers would be told what to do and then
+  // immediately stopped, which costs more than it returns.
+  var SPLIT_SPAWN_MOVETIME = 900;
+  var SPLIT_MIN_MOVETIME = 220;
+  var SPLIT_GRACE_MS = 1500;
+  var helpers = [];
+
   /* ------------------------------------------------------------- utilities */
 
   function clampInt(value, lo, hi) {
@@ -124,7 +143,9 @@
       hashMb: hashMbFor(cfg),
       maxMovetime: MAX_MOVETIME,
       multipv: lastMultiPV,
-      skill: lastSkill
+      skill: lastSkill,
+      threads: splitWidth(),
+      parallel: parallelWidth()
     };
   }
 
@@ -233,6 +254,9 @@
     lastSkill = 20;
     error = null;
     engineLineBuffer = '';
+    // The helpers belong to the build that is going away. Keeping them would
+    // leave workers of the old build answering for the new one.
+    destroyHelpers();
     clearTimer('init');
     clearTimer('stop');
     clearTimer('watchdog');
@@ -379,6 +403,9 @@
     if (worker) {
       try { worker.terminate(); } catch (e) { /* ignore */ }
     }
+    // Whatever took the primary out may take the helpers too; they are cheap to
+    // rebuild on the next long search and worthless if half of them are dead.
+    destroyHelpers();
 
     var hasWork = !!(active || pending);
     if (wasReady && IS_MOBILE && buildSetting === 'full' && !fullBuildFailed) {
@@ -477,7 +504,348 @@
     }
   }
 
+  /* ------------------------------------------------- root-split parallelism */
+
+  /*
+   * How many engines this machine can feed. Under four cores there is nothing
+   * to divide, and a phone gets one: several copies of the 96 MB network inside
+   * a single tab is how a phone decides to kill the page.
+   */
+  function splitWidth() {
+    if (IS_MOBILE) return 1;
+    var cores = parseInt(
+      (globalThis.navigator && globalThis.navigator.hardwareConcurrency) || 0, 10
+    );
+    if (!cores || cores < 4) return 1;
+    return Math.min(MAX_HELPERS + 1, Math.max(2, Math.floor(cores / 2)));
+  }
+
+  // Round-robin, so every worker gets both cheap and expensive moves instead of
+  // one of them inheriting all the captures.
+  function splitMoves(moves, parts) {
+    var groups = [];
+    for (var i = 0; i < parts; i++) groups.push([]);
+    for (var j = 0; j < moves.length; j++) groups[j % parts].push(moves[j]);
+    return groups;
+  }
+
+  /*
+   * Scores from different workers are comparable because they come from the
+   * same evaluation on the same position. Mate scores need converting: +M1 must
+   * outrank +M7, and -M7 must outrank -M1.
+   */
+  function scoreValue(score) {
+    if (!score || typeof score.value !== 'number') return null;
+    if (score.type === 'mate') {
+      return score.value >= 0 ? 100000 - score.value : -100000 - score.value;
+    }
+    return score.value;
+  }
+
+  function pickSplitWinner(results) {
+    var best = null;
+    for (var i = 0; i < results.length; i++) {
+      var item = results[i];
+      if (!item || !item.uci || item.uci === '(none)') continue;
+      var value = scoreValue(item.score);
+      if (!best) {
+        best = { item: item, value: value };
+        continue;
+      }
+      if (value == null) continue;
+      if (best.value == null || value > best.value) {
+        best = { item: item, value: value };
+        continue;
+      }
+      // Drawn positions produce identical scores all the time. Keeping the
+      // primary's move stops the same position from answering differently on
+      // every visit.
+      if (value === best.value && item.index < best.item.index) {
+        best = { item: item, value: value };
+      }
+    }
+    return best ? best.item : null;
+  }
+
+  function parseHelperInfo(line) {
+    if (line.indexOf('info ') !== 0) return null;
+    var depth = /\bdepth (\d+)/.exec(line);
+    var score = /\bscore (cp|mate) (-?\d+)/.exec(line);
+    if (!score) return null;
+    return {
+      depth: depth ? parseInt(depth[1], 10) : 0,
+      score: { type: score[1], value: parseInt(score[2], 10) }
+    };
+  }
+
+  // How much of that ceiling is actually up right now: a helper that is still
+  // loading the network is not searching anything, and saying otherwise would
+  // be a lie in the popup.
+  function parallelWidth() {
+    var count = 1;
+    for (var i = 0; i < helpers.length; i++) {
+      if (helpers[i].ready && !helpers[i].dead) count++;
+    }
+    return count;
+  }
+
+  function helperHashMb() {
+    // The table is shared in a real SMP build; here each engine needs its own,
+    // so the total stays what one engine had.
+    var parts = Math.max(1, splitWidth());
+    return Math.max(16, Math.floor(hashMbFor(activeBuildConfig()) / parts));
+  }
+
+  function createHelper() {
+    var cfg = activeBuildConfig();
+    var worker;
+    try {
+      worker = new Worker(api.runtime.getURL(cfg.url));
+    } catch (e) {
+      return null;
+    }
+    var helper = {
+      worker: worker,
+      ready: false,
+      armed: false,     // we are waiting for its bestmove
+      busy: false,      // it has a search in flight we no longer want
+      dead: false,
+      buffer: '',
+      index: helpers.length + 1,
+      best: null,
+      score: null,
+      depth: 0,
+      onDone: null
+    };
+    worker.onmessage = function (event) {
+      if (helper.dead) return;
+      var data = event && event.data;
+      if (typeof data !== 'string') {
+        if (data && typeof data.data === 'string') data = data.data;
+        else return;
+      }
+      feedHelper(helper, data);
+    };
+    worker.onerror = function () { dropHelper(helper); };
+    worker.onmessageerror = function () { dropHelper(helper); };
+    try {
+      worker.postMessage('uci');
+    } catch (e) {
+      dropHelper(helper);
+      return null;
+    }
+    helpers.push(helper);
+    return helper;
+  }
+
+  function feedHelper(helper, data) {
+    helper.buffer += data;
+    var parts = helper.buffer.split(/\r?\n/);
+    helper.buffer = parts.pop();
+    for (var i = 0; i < parts.length; i++) {
+      var line = parts[i].trim();
+      if (!line) continue;
+      if (line === 'uciok') {
+        try {
+          helper.worker.postMessage('setoption name Hash value ' + helperHashMb());
+          helper.worker.postMessage('setoption name MultiPV value 1');
+          helper.worker.postMessage('isready');
+        } catch (e) {
+          dropHelper(helper);
+          return;
+        }
+        continue;
+      }
+      if (line === 'readyok') {
+        helper.ready = true;
+        // The popup and the chip both report how much of the ceiling is up.
+        broadcastStatus();
+        continue;
+      }
+      if (line.indexOf('info ') === 0) {
+        var info = parseHelperInfo(line);
+        if (info) {
+          helper.score = info.score;
+          helper.depth = info.depth;
+        }
+        continue;
+      }
+      if (line.indexOf('bestmove') === 0) {
+        helper.busy = false;
+        if (!helper.armed) continue;
+        helper.armed = false;
+        helper.best = parseBestMove(line);
+        var done = helper.onDone;
+        helper.onDone = null;
+        if (done) done(helper);
+      }
+    }
+  }
+
+  function dropHelper(helper) {
+    if (!helper || helper.dead) return;
+    helper.dead = true;
+    helper.armed = false;
+    helper.busy = false;
+    helper.onDone = null;
+    try { helper.worker.terminate(); } catch (e) { /* already gone */ }
+    var at = helpers.indexOf(helper);
+    if (at >= 0) helpers.splice(at, 1);
+    for (var i = 0; i < helpers.length; i++) helpers[i].index = i + 1;
+  }
+
+  function destroyHelpers() {
+    var list = helpers.slice();
+    helpers.length = 0;
+    for (var i = 0; i < list.length; i++) {
+      var helper = list[i];
+      helper.dead = true;
+      helper.armed = false;
+      helper.busy = false;
+      helper.onDone = null;
+      try { helper.worker.terminate(); } catch (e) { /* already gone */ }
+    }
+  }
+
+  function ensureHelpers(count) {
+    for (var i = helpers.length; i < count; i++) {
+      if (!createHelper()) break;
+    }
+  }
+
+  /*
+   * Workers are spawned after a long search finishes, never during one: the
+   * opponent is thinking then, so the CPU is idle anyway and the next move
+   * starts with them warm.
+   */
+  function warmHelpers() {
+    if (!ready || error || restartTimer || starting) return;
+    var width = splitWidth();
+    if (width < 2) return;
+    if (helpers.length >= width - 1) return;
+    ensureHelpers(width - 1);
+    broadcastStatus();
+  }
+
+  function planSplit(request) {
+    // MultiPV already spends the same time on alternatives, and the humanized
+    // presets deliberately play below their best move: handing the choice to a
+    // score comparison would break both.
+    if (request.multiPV > 1) return null;
+    if (request.skill < 20) return null;
+    if (request.movetime < SPLIT_MIN_MOVETIME) return null;
+    var width = splitWidth();
+    if (width < 2) return null;
+    var moves = request.rootMoves || [];
+    if (moves.length < width * 2) return null;
+
+    var pool = [];
+    for (var i = 0; i < helpers.length && pool.length < width - 1; i++) {
+      var helper = helpers[i];
+      if (helper.ready && !helper.armed && !helper.busy && !helper.dead) pool.push(helper);
+    }
+    if (!pool.length) return null;
+
+    return {
+      helpers: pool,
+      groups: splitMoves(moves, pool.length + 1),
+      results: [],
+      done: 0,
+      finished: false,
+      timer: null
+    };
+  }
+
+  function startHelperSearch(request, helper, moves) {
+    if (!helper || helper.dead || !moves || !moves.length) return;
+    helper.armed = true;
+    helper.busy = true;
+    helper.best = null;
+    helper.score = null;
+    helper.depth = 0;
+    helper.onDone = function (finished) {
+      if (current === request && request.split) recordSplitResult(request, finished);
+    };
+    try {
+      helper.worker.postMessage('position fen ' + request.fen);
+      helper.worker.postMessage('go movetime ' + request.movetime +
+        ' searchmoves ' + moves.join(' '));
+    } catch (e) {
+      dropHelper(helper);
+    }
+  }
+
+  function recordSplitResult(request, helper) {
+    var split = request.split;
+    if (!split || split.finished) return;
+    split.results.push({
+      uci: helper.best,
+      score: helper.score,
+      depth: helper.depth,
+      index: helper.index
+    });
+    split.done++;
+    if (split.done >= split.helpers.length + 1) finalizeSplit(request);
+  }
+
+  // Stop the helpers of a search whose answer can no longer be published, but
+  // keep them in flight until their bestmove arrives: arming one that is still
+  // searching would credit its old move to the next position.
+  function stopSplitHelpers(request) {
+    var split = request && request.split;
+    if (!split) return;
+    for (var i = 0; i < split.helpers.length; i++) {
+      var helper = split.helpers[i];
+      helper.onDone = null;
+      if (!helper.armed) continue;
+      helper.armed = false;
+      try { helper.worker.postMessage('stop'); } catch (e) { /* gone */ }
+    }
+  }
+
+  function releaseSplit(request) {
+    var split = request && request.split;
+    if (!split) return;
+    if (split.timer) { clearTimeout(split.timer); split.timer = null; }
+    split.finished = true;
+    stopSplitHelpers(request);
+  }
+
+  function finalizeSplit(request) {
+    var split = request.split;
+    if (!split || split.finished) return;
+    split.finished = true;
+    if (split.timer) { clearTimeout(split.timer); split.timer = null; }
+    stopSplitHelpers(request);
+
+    var winner = pickSplitWinner(split.results);
+    if (winner && winner.index > 0) {
+      // The move came from a helper, so the primary's lines describe a
+      // different part of the tree. Publish the winner's own evaluation.
+      request.lines = [];
+      request.lines[1] = {
+        multipv: 1,
+        depth: winner.depth || 0,
+        seldepth: null,
+        score: winner.score || null,
+        pv: winner.uci ? [winner.uci] : []
+      };
+    }
+    closeSearch(winner ? winner.uci : '');
+  }
+
   /* -------------------------------------------------------------- searching */
+
+  function normalizeRootMoves(value) {
+    if (!value || !value.length) return null;
+    var out = [];
+    for (var i = 0; i < value.length && out.length < 40; i++) {
+      var uci = String(value[i] || '');
+      if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) continue;
+      out.push(uci);
+    }
+    return out.length ? out : null;
+  }
 
   function normalizeRequest(data, port) {
     if (!data || typeof data.fen !== 'string') return null;
@@ -496,6 +864,8 @@
       movetime: clampInt(data.movetime, 100, MAX_MOVETIME),
       depth: clampInt(data.depth, 0, 60),
       skill: data.skill == null || data.skill === '' ? 20 : clampInt(data.skill, 0, 20),
+      rootMoves: normalizeRootMoves(data.rootMoves),
+      split: null,
       lines: [],
       cancelled: false,
       startedAt: 0
@@ -524,6 +894,11 @@
     request.startedAt = Date.now();
     current = request;
 
+    // Decide the division of labour before the first command goes out: the
+    // primary has to be given its own share of the root moves in the same "go".
+    var split = request.split = planSplit(request);
+    var primary = split ? split.groups[0] : null;
+
     if (lastMultiPV !== request.multiPV) {
       lastMultiPV = request.multiPV;
       engine.postMessage('setoption name MultiPV value ' + request.multiPV);
@@ -537,11 +912,14 @@
 
     try {
       engine.postMessage('position fen ' + request.fen);
-      if (request.depth > 0) {
-        engine.postMessage('go depth ' + request.depth + ' movetime ' + request.movetime);
-      } else {
-        engine.postMessage('go movetime ' + request.movetime);
-      }
+      // UCI eats the token that stops the move list: "searchmoves" has to come
+      // last, or the limit after it is swallowed and the search never ends on
+      // time.
+      var go = 'go';
+      if (request.depth > 0) go += ' depth ' + request.depth;
+      go += ' movetime ' + request.movetime;
+      if (primary) go += ' searchmoves ' + primary.join(' ');
+      engine.postMessage(go);
     } catch (e) {
       onEngineFailure('Stockfish: не удалось начать поиск');
       return;
@@ -556,12 +934,28 @@
       }
     }, limit);
 
+    if (split) {
+      for (var i = 0; i < split.helpers.length; i++) {
+        startHelperSearch(request, split.helpers[i], split.groups[i + 1]);
+      }
+      // The merge cannot wait for a worker that has gone quiet. This is a stop
+      // like any other, so the primary's own bestmove remains the trigger - it
+      // is the last answer to arrive, and whoever is asking still gets one.
+      split.timer = setTimeout(function () {
+        split.timer = null;
+        if (current !== request || awaitingStop || request.cancelled) return;
+        split.timedOut = true;
+        requestStop();
+      }, request.movetime + SPLIT_GRACE_MS);
+    }
+
     broadcastStatus();
   }
 
   function requestStop() {
     if (awaitingStop) return;
     awaitingStop = true;
+    if (current) stopSplitHelpers(current);
     try {
       if (engine) engine.postMessage('stop');
     } catch (e) { /* the stop watchdog will restart the engine */ }
@@ -622,6 +1016,34 @@
   }
 
   function onBestMove(uci) {
+    var request = current;
+    var split = request && request.split;
+
+    if (request && split && !split.finished && !request.cancelled) {
+      // A deadline stop is ours, not the user's: the primary's answer still
+      // counts even though a stop is technically in flight.
+      var usable = !awaitingStop || (split.timedOut && !pending);
+      if (usable) {
+        if (awaitingStop) awaitingStop = false;
+        var lines = collectLines(request);
+        split.results.push({
+          uci: uci,
+          score: lines.length ? lines[0].score : null,
+          depth: lines.length ? lines[0].depth : 0,
+          index: 0
+        });
+        split.done++;
+        if (split.timedOut || split.done >= split.helpers.length + 1) {
+          finalizeSplit(request);
+        }
+        return;
+      }
+    }
+
+    closeSearch(uci);
+  }
+
+  function closeSearch(uci) {
     clearTimer('watchdog');
     clearTimer('stop');
     clearTimer('info');
@@ -645,12 +1067,16 @@
         sendError(request, 'В позиции нет доступных ходов');
       }
     }
+    if (request) releaseSplit(request);
 
     broadcastStatus();
 
     var next = pending;
     pending = null;
     if (next) startRequest(next);
+    // A long search just proved this machine has time to spend, and the
+    // opponent is thinking now: this is the moment to load the extra workers.
+    else if (request && request.movetime >= SPLIT_SPAWN_MOVETIME) warmHelpers();
   }
 
   /* ------------------------------------------------------------ port routing */
@@ -730,6 +1156,76 @@
     if (touched) broadcastStatus();
   }
 
+  /* --------------------------------------------------------- tablebase */
+
+  /*
+   * Perfect endgame play without shipping the tables. A position with seven
+   * pieces or fewer has an exact answer, and the Lichess tablebase serves it
+   * over HTTPS. The request is made here rather than in the content script:
+   * the background page has the host permission, is not subject to the page's
+   * origin rules, and behaves identically on desktop and Android. Shipping
+   * Syzygy instead would mean ~1 GB for five pieces and ~150 GB for six, which
+   * is far outside both the package limit and a phone's memory.
+   */
+  var TB_ENDPOINT = 'https://tablebase.lichess.ovh/standard?fen=';
+  var TB_TIMEOUT_MS = 4000;
+  var TB_CACHE_MAX = 512;
+  var tbCache = Object.create(null);
+  var tbCacheKeys = [];
+
+  function tbRemember(key, data) {
+    if (tbCache[key]) return;
+    tbCache[key] = data;
+    tbCacheKeys.push(key);
+    while (tbCacheKeys.length > TB_CACHE_MAX) {
+      var old = tbCacheKeys.shift();
+      delete tbCache[old];
+    }
+  }
+
+  function tbReply(respond, payload) {
+    try { respond(payload); } catch (e) { /* channel already closed */ }
+  }
+
+  function tablebaseQuery(fen, respond) {
+    var key = String(fen || '').trim();
+    if (!key) {
+      tbReply(respond, { ok: false, error: 'empty fen' });
+      return;
+    }
+    if (tbCache[key]) {
+      tbReply(respond, { ok: true, data: tbCache[key], cached: true });
+      return;
+    }
+    var url = TB_ENDPOINT + encodeURIComponent(key);
+    var done = false;
+    var timer = setTimeout(function () {
+      if (done) return;
+      done = true;
+      tbReply(respond, { ok: false, error: 'timeout' });
+    }, TB_TIMEOUT_MS);
+
+    fetch(url, { credentials: 'omit', cache: 'no-store' }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (data) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (!data || !data.moves) throw new Error('empty answer');
+      tbRemember(key, data);
+      tbReply(respond, { ok: true, data: data });
+    }).catch(function (err) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      tbReply(respond, {
+        ok: false,
+        error: String((err && err.message) || err || 'failed')
+      });
+    });
+  }
+
   api.runtime.onConnect.addListener(function (port) {
     if (!port || port.name !== 'ca-engine') return;
     ports.add(port);
@@ -777,6 +1273,11 @@
         multipv: lastMultiPV,
         skill: lastSkill
       });
+      return true;
+    }
+
+    if (message.type === 'ca-tablebase') {
+      tablebaseQuery(message.fen, sendResponse);
       return true;
     }
 

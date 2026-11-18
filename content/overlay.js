@@ -129,6 +129,7 @@
       hud = el('div', 'ca-hud', root);
       hud.id = 'ca-hud';
       refs.score = el('span', 'ca-hud__score', hud);
+      refs.phase = el('span', 'ca-hud__phase', hud);
       refs.move = el('span', 'ca-hud__move', hud);
       refs.time = el('span', 'ca-hud__time', hud);
       refs.dot = el('span', 'ca-hud__dot', hud);
@@ -472,6 +473,7 @@
       if (state.error) return state.error;
       if (!state.engineReady) return '\u0437\u0430\u043f\u0443\u0441\u043a Stockfish\u2026';
       if (state.gameOver) return '\u043f\u0430\u0440\u0442\u0438\u044f \u043e\u043a\u043e\u043d\u0447\u0435\u043d\u0430';
+      if (state.tablebase && state.tablebaseText) return state.tablebaseText;
       if (state.autoStatus) return state.autoStatus;
       if (state.thinking) return '\u0434\u0443\u043c\u0430\u044e\u2026';
       if (state.autoPlay && state.myTurn) return '\u0430\u0432\u0442\u043e\u0445\u043e\u0434';
@@ -525,7 +527,10 @@
       else if (thinking || state.autoStatus) tone = 'busy';
       else if (state.myTurn) tone = 'ok';
 
-      var score = state.scoreText || '\u2014';
+      var tb = state.tablebase || '';
+      // A tablebase move is an exact result, so the chip shows TB instead of
+      // an evaluation that only approximates the same position.
+      var score = tb || state.scoreText || '\u2014';
       var move = state.san || '';
       if (state.error) move = '\u043e\u0448\u0438\u0431\u043a\u0430';
       else if (!move && thinking) move = '\u0430\u043d\u0430\u043b\u0438\u0437\u2026';
@@ -533,14 +538,24 @@
       else if (!move && !state.engineReady) move = '\u0437\u0430\u043f\u0443\u0441\u043a';
 
       setText(refs.score, score);
+      setText(refs.phase, state.phase || '');
       setText(refs.move, move);
       renderThink();
-      refs.score.setAttribute('data-tone', scoreTone(score));
+      refs.score.setAttribute('data-tone',
+        tb ? (state.tablebaseTone || 'idle') : scoreTone(score));
       hud.setAttribute('data-tone', tone);
 
       // Everything secondary lives in the native tooltip, not on the chip.
       var title = [];
       if (state.engineLabel) title.push(state.engineLabel);
+      // More than one engine means the root is split between them; saying so
+      // explains both the extra memory and the move that is not the first
+      // engine's own favourite.
+      if (state.engineThreads > 1) title.push('\u043f\u043e\u0442\u043e\u043a\u043e\u0432: ' + state.engineThreads);
+      if (state.phase) title.push('\u0444\u0430\u0437\u0430: ' + state.phase);
+      // The last exact decision stays in the tooltip after the move, where a
+      // bullet player can actually find it.
+      if (state.tablebaseText && !state.tablebase) title.push(state.tablebaseText);
       if (state.depth) title.push('\u0433\u043b. ' + state.depth);
       var spent = thinkElapsed();
       if (spent != null) {

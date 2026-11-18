@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "Chess Assist — Stockfish",
   "short_name": "Chess Assist",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Подсказывает лучший ход Stockfish на chess.com и lichess.org. Есть необязательный автоход.",
   "author": "Chess Assist",
   "browser_specific_settings": {
@@ -23,7 +23,8 @@
     "https://chess.com/*",
     "https://*.chess.com/*",
     "https://lichess.org/*",
-    "https://*.lichess.org/*"
+    "https://*.lichess.org/*",
+    "https://tablebase.lichess.ovh/*"
   ],
   "background": {
     "scripts": [

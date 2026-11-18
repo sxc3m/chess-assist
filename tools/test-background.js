@@ -46,6 +46,48 @@ FakeWorker.prototype.terminate = function () {
   this.dead = true;
 };
 
+/*
+ * The Node build of stockfish.js keeps one engine per process, so a second
+ * "worker" would share the first one's instance and re-enter its init. The
+ * helper engines get a stub instead: enough of UCI to be told what to do, which
+ * keeps this file about the host and leaves the parallel scheduling to
+ * tools/test-parallel.js.
+ */
+function StubWorker() {
+  this.dead = false;
+  this.onmessage = null;
+  this.onerror = null;
+  this.onmessageerror = null;
+  workerCount++;
+}
+
+StubWorker.prototype.emit = function (line) {
+  var self = this;
+  setImmediate(function () {
+    if (self.dead || !self.onmessage) return;
+    self.onmessage({ data: line + '\n' });
+  });
+};
+
+StubWorker.prototype.postMessage = function (command) {
+  if (this.dead) return;
+  if (command === 'uci') { this.emit('uciok'); return; }
+  if (command === 'isready') { this.emit('readyok'); return; }
+  if (command.indexOf('go') === 0) {
+    var moves = /searchmoves ([^ ]+)/.exec(command);
+    this.emit('info depth 10 score cp 5 pv ' + (moves ? moves[1] : 'e2e4'));
+    this.emit('bestmove ' + (moves ? moves[1] : 'e2e4'));
+  }
+};
+
+StubWorker.prototype.terminate = function () {
+  this.dead = true;
+};
+
+function createWorker(url) {
+  return workerCount === 0 ? new FakeWorker(url) : new StubWorker(url);
+}
+
 var browser = {
   runtime: {
     getURL: function (relative) { return 'moz-extension://chess-assist-test/' + relative; },
@@ -72,8 +114,14 @@ var sandbox = {
   setInterval: setInterval,
   clearInterval: clearInterval,
   setImmediate: setImmediate,
-  Worker: FakeWorker,
-  browser: browser
+  Worker: createWorker,
+  browser: browser,
+  // A desktop with eight cores: the split is supposed to switch itself on for
+  // a long search and stay off where it cannot pay for itself.
+  navigator: {
+    hardwareConcurrency: 8,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0'
+  }
 };
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);

@@ -67,7 +67,24 @@
     humanizeRarePct: 8,
     humanizeFastPct: 15,
     humanizeFastMs: 3000,
-    humanizeClockAware: true
+    humanizeClockAware: true,
+    // Start the next game automatically when the result dialog shows up, so
+    // the user can walk away from the board.
+    autoRematch: false,
+    // Time control pressed last ("3+0", "10+0", ...). It only decides which
+    // offer wins when the dialog shows more than one; empty means "any".
+    rematchControl: '',
+    // Send the move through the board's own input (pointer events on the
+    // squares) instead of the site's internal game object. Slower by a hundred
+    // milliseconds or so, but the move then originates where a human move
+    // originates. Off by default: the DOM path is only as reliable as the
+    // site's markup.
+    humanInput: false,
+    // Perfect endgame play from the Lichess 7-piece tablebase. Only positions
+    // with seven pieces or fewer have a tablebase entry, and only the pure
+    // engine presets use it: a humanized profile is supposed to miss things,
+    // so feeding it perfect endgame moves would contradict its own premise.
+    tablebase: false
   };
 
   var state = {
@@ -102,6 +119,7 @@
     engineReady: false,
     engineError: null,
     engineLabel: 'Stockfish 19',
+    engineThreads: 1,
     error: null,
     clockTurn: null,
     clockDisagreement: 0,
@@ -111,6 +129,8 @@
     humanChoice: null,        // { fen, uci, firstSan, lossCp } chosen once per position
     humanTargetFen: null,
     humanTargetAt: 0,
+    rematchCheckAt: 0,
+    rematch: { armedAt: 0, attempts: 0 },
     humanLastDelay: 0,
     humanForm: 1,             // per-game form factor around the preset strength
     ratings: { w: null, b: null }, // live site ratings for both colours
@@ -138,8 +158,235 @@
     pendingBoard: null,
     pendingSince: 0,
     wasEnabled: true,
-    engineWasReady: false
+    engineWasReady: false,
+    // Tablebase state. tbChoice is the move to play for the current FEN,
+    // tbPending is the request in flight, tbCache keeps recent answers so a
+    // repeated position (a shuffle, a rematch) costs nothing.
+    tbChoice: null,
+    tbPending: null,
+    tbCache: Object.create(null),
+    // The last exact decision, kept for the rest of the game: the chip shows a
+    // tablebase move for a fraction of a second in bullet, so the proof has to
+    // outlive the move or nobody ever sees it.
+    tbLast: null,
+    tbHit: 0,
+    tbGameOver: false
   };
+
+  /* ------------------------------------------------------------ tablebase */
+
+  var TB_ENDPOINT = 'https://tablebase.lichess.ovh/standard?fen=';
+  var TB_MAX_PIECES = 7;
+  // Lower is better for us. The category on a move is the result of the
+  // position *after* the move for the side that then has to move, so "loss"
+  // there means the opponent is lost, which is what we want.
+  var TB_RANK = {
+    'loss': 0,
+    'blessed loss': 1,
+    'draw': 2,
+    'cursed win': 3,
+    'win': 4,
+    'unknown': 5
+  };
+
+  /*
+   * The category is written for the side that has to move *after* our move, so
+   * "loss" means the opponent is lost. Translated here rather than in the UI:
+   * the chip and the popup must say the same thing, and the raw API vocabulary
+   * means nothing to a player glancing at the board.
+   */
+  function tbOutcomeText(category) {
+    switch (category) {
+      case 'loss': return 'выигрыш';
+      case 'blessed loss': return 'выигрыш, но 50 ходов';
+      case 'draw': return 'ничья';
+      case 'cursed win': return 'ничья по правилу 50 ходов';
+      case 'win': return 'проигрыш';
+      default: return 'исход неизвестен';
+    }
+  }
+
+  function tbOutcomeTone(category) {
+    if (category === 'loss' || category === 'blessed loss') return 'pos';
+    if (category === 'win' || category === 'cursed win') return 'neg';
+    return 'idle';
+  }
+
+  function tablebaseText() {
+    if (state.tbChoice && state.tbChoice.fen === state.fen) {
+      return 'таблицы: ' + tbOutcomeText(state.tbChoice.category);
+    }
+    if (state.tbLast) {
+      return 'таблицы: ' + tbOutcomeText(state.tbLast.category) +
+        ' (последняя позиция)';
+    }
+    return '';
+  }
+
+  function tablebaseChip() {
+    return state.tbChoice && state.tbChoice.fen === state.fen ? 'TB' : '';
+  }
+
+  function phaseChip() {
+    var phase = gamePhase();
+    if (!phase) return '';
+    return IS_MOBILE ? phase.short : phase.label;
+  }
+
+  function tbPieceCount(fen) {
+    var board = String(fen || '').split(' ')[0];
+    var n = 0;
+    for (var i = 0; i < board.length; i++) {
+      var ch = board.charAt(i);
+      if (ch === '/' || (ch >= '1' && ch <= '8')) continue;
+      n++;
+    }
+    return n;
+  }
+
+  // The halfmove clock and move number do not change the tablebase answer,
+  // only the first four fields do. That also makes the cache key stable.
+  function tbKey(fen) {
+    var parts = String(fen || '').trim().split(/\s+/);
+    if (parts.length < 4) return null;
+    return parts.slice(0, 4).join(' ');
+  }
+
+  /*
+   * Pick the tablebase move. Winning positions take the shortest forced win
+   * (smallest DTZ) so the fifty-move counter never runs out; lost positions
+   * take the longest defence (largest DTZ) because the only thing left to play
+   * for is a mistake by the opponent or the clock.
+   */
+  function pickTablebaseMove(data) {
+    if (!data || !data.moves || !data.moves.length) return null;
+    var best = null;
+    var bestRank = 99;
+    var bestDtz = 0;
+    for (var i = 0; i < data.moves.length; i++) {
+      var m = data.moves[i];
+      if (!m || !m.uci) continue;
+      var rank = TB_RANK.hasOwnProperty(m.category) ? TB_RANK[m.category] : 5;
+      var dtz = typeof m.dtz === 'number' && isFinite(m.dtz)
+        ? Math.abs(m.dtz)
+        : 0;
+      if (!best) {
+        best = m;
+        bestRank = rank;
+        bestDtz = dtz;
+        continue;
+      }
+      if (rank !== bestRank) {
+        if (rank < bestRank) { best = m; bestRank = rank; bestDtz = dtz; }
+        continue;
+      }
+      if (rank <= 1) {
+        // We win: the quickest conversion is the least likely to spoil.
+        if (dtz < bestDtz) { best = m; bestDtz = dtz; }
+      } else if (rank >= 3) {
+        // We lose: make the opponent work for it for as long as possible.
+        if (dtz > bestDtz) { best = m; bestDtz = dtz; }
+      }
+    }
+    if (!best) return null;
+    return {
+      uci: best.uci,
+      san: best.san || best.uci,
+      category: best.category || '',
+      dtz: best.dtz
+    };
+  }
+
+  function tablebaseEligible() {
+    if (!state.settings.enabled || !state.settings.tablebase) return false;
+    // A humanized preset is defined by its imperfection. Perfect endgame moves
+    // would make its review metrics jump at exactly the phase where a human is
+    // most likely to slip, which is the opposite of what it is for.
+    if (state.settings.humanize) return false;
+    if (!state.fen || state.gameOver || !state.myColor) return false;
+    if (state.turn !== state.myColor) return false;
+    return tbPieceCount(state.fen) <= TB_MAX_PIECES;
+  }
+
+  function tablebaseChoiceFor(fen) {
+    return state.tbChoice && state.tbChoice.fen === fen ? state.tbChoice : null;
+  }
+
+  /*
+   * Fetch the tablebase answer for the current position. The request is issued
+   * as soon as the position appears, in parallel with the engine search, so by
+   * the time a move is due the answer is normally already in hand. The fetch
+   * lives in the background page: it holds the host permission and is not
+   * subject to the page's origin rules, and it behaves the same on desktop and
+   * on Android.
+   */
+  function requestTablebase() {
+    if (!tablebaseEligible()) return false;
+    var fen = state.fen;
+    var key = tbKey(fen);
+    if (!key) return false;
+    if (tablebaseChoiceFor(fen)) return false;
+    if (state.tbPending && state.tbPending.fen === fen) return false;
+    if (state.tbCache[key] !== undefined) {
+      adoptTablebase(fen, state.tbCache[key]);
+      return true;
+    }
+    if (!api || !api.runtime || typeof api.runtime.sendMessage !== 'function') {
+      return false;
+    }
+    state.tbPending = { fen: fen, key: key, at: Date.now() };
+    try {
+      api.runtime.sendMessage({ type: 'ca-tablebase', fen: key }, function (resp) {
+        if (!state.tbPending || state.tbPending.fen !== fen) return;
+        state.tbPending = null;
+        if (!resp || !resp.ok) {
+          return;
+        }
+        state.tbCache[key] = resp.data;
+        if (state.fen === fen) adoptTablebase(fen, resp.data);
+      });
+    } catch (e) {
+      state.tbPending = null;
+      return false;
+    }
+    return true;
+  }
+
+  /*
+   * Turn a tablebase answer into the move we are about to play. A result that
+   * arrives after the board has moved on is dropped, and so is one that names
+   * a move the board does not accept: the tablebase is authoritative about the
+   * position, not about our reading of it.
+   */
+  function adoptTablebase(fen, data) {
+    if (!fen || !state.fen || fen !== state.fen) return false;
+    if (!state.myColor || state.turn !== state.myColor || state.gameOver) return false;
+    var pick = pickTablebaseMove(data);
+    if (!pick) return false;
+    var move = core.uciToMove(pick.uci);
+    if (!move || !isLegalMove(fen, move)) return false;
+    state.tbChoice = {
+      fen: fen,
+      uci: pick.uci,
+      firstSan: pick.san,
+      category: pick.category,
+      dtz: pick.dtz
+    };
+    state.tbLast = {
+      category: pick.category,
+      dtz: pick.dtz,
+      san: pick.san,
+      uci: pick.uci
+    };
+    state.tbHit++;
+    state.bestUci = pick.uci;
+    state.bestMove = move;
+    state.bestSan = pick.san;
+    state.engineError = null;
+    render();
+    scheduleAutoMove();
+    return true;
+  }
 
   function clampInt(value, lo, hi) {
     var n = parseInt(value, 10);
@@ -212,12 +459,12 @@
   function clockStage() {
     var c = clockState();
     if (c.mine == null) return 0;
-    if (c.mine <= 3000) return 3;
-    if (c.mine <= 8000) return 2;
-    if (c.mine <= 15000) return 1;
+    if (c.mine <= 4000) return 3;
+    if (c.mine <= 10000) return 2;
+    if (c.mine <= 20000) return 1;
     if (state.settings.humanizeClockAware && c.mine <= 60000 && c.lead != null) {
-      if (c.lead <= -5000) return 2;
-      if (c.lead <= 0) return 1;
+      if (c.lead <= -4000) return 2;
+      if (c.lead <= -1000) return 1;
       if (c.lead < 4000) return 1;
     }
     return 0;
@@ -241,7 +488,11 @@
    * looks like one person's good and bad days instead of a constant machine.
    */
   function newHumanForm() {
-    state.humanForm = 0.8 + Math.random() * 0.45;
+    // Wider than a comfortable range on purpose: real players have days when
+    // they see everything and days when they see nothing, and the spread
+    // between those games is a human signal an engine with a fixed error rate
+    // does not produce. 0.6 = a bad day, 1.6 = a bad one.
+    state.humanForm = 0.6 + Math.random() * 1.0;
     state.humanLastDelay = 0;
     // A new game starts with a fresh cushion budget.
     state.rescue = false;
@@ -266,23 +517,44 @@
   /*
    * Rating -> play-style table. Columns: chess.com-equivalent Elo, search
    * depth cap, chance of a non-top move, centipawn loss budget, blunder
-   * chance. The numbers are calibrated so a full game review lands in the
-   * accuracy / ACPL / blunder ranges those ratings actually produce, not just
-   * "roughly weaker".
+   * chance.
+   *
+   * The columns are chosen so that the *metrics a review shows* land inside
+   * the band real players of that rating produce. The reference is bullet/blitz
+   * at the account's own time control, not a correspondence game:
+   *
+   *   Elo    top-1 match   ACPL   accuracy
+   *   1200   ~30 %        ~55    65-70 %
+   *   1600   ~40 %        ~38    72-78 %
+   *   2000   ~46 %        ~30    80-84 %
+   *   2400   ~50 %        ~26    84-87 %
+   *   2800   ~52 %        ~22    87-90 %
+   *   3000   ~53 %        ~20    88-91 %
+   *
+   * That is why the error percentage flattens near the top instead of going
+   * to zero: a 3000 player still does not play the engine's first choice half
+   * the time, he just makes cheaper mistakes. The depth cap rises with the
+   * rating so the alternatives are strong; the loss budget falls so the
+   * accuracy stays believable.
+   *
+   * The blunder column is deliberately non-zero all the way up. A real 3000
+   * in bullet still drops a pawn in a scramble, and a profile with no blunders
+   * over hundreds of games is itself the anomaly, no matter how strong the
+   * play is.
    */
-  var STRENGTH_TABLE = [
-    [ 800,  2, 80, 420, 11],
-    [1000,  2, 76, 400, 10],
-    [1200,  3, 72, 380,  9],
-    [1400,  3, 68, 350,  8],
-    [1600,  4, 64, 320, 6.5],
-    [1750,  5, 60, 300,  6],
-    [1900,  6, 55, 250, 4.5],
-    [2050,  8, 47, 190, 3.5],
-    [2200, 10, 38, 140, 2.5],
-    [2400, 12, 28,  90, 1.5],
-    [2600, 14, 18,  50, 0.6],
-    [2800, 20, 10,  30,   0]
+  var PROFILE_TABLE = [
+    [ 800,  2, 80, 280, 8],
+    [1000,  3, 74, 240, 7],
+    [1200,  4, 69, 200, 6],
+    [1400,  5, 65, 170, 5],
+    [1600,  6, 61, 145, 4],
+    [1800,  7, 57, 125, 3.2],
+    [2000,  8, 54, 105, 2.5],
+    [2200,  9, 52,  90, 2.2],
+    [2400, 11, 50,  80, 1.8],
+    [2600, 12, 49,  72, 1.5],
+    [2800, 13, 48,  66, 1.2],
+    [3000, 14, 47,  60, 1.0]
   ];
 
   function lerp(a, b, t) {
@@ -292,13 +564,13 @@
   function strengthForRating(elo) {
     var n = Number(elo);
     if (!isFinite(n) || n <= 0) return null;
-    if (n <= STRENGTH_TABLE[0][0]) {
-      var first = STRENGTH_TABLE[0];
+    if (n <= PROFILE_TABLE[0][0]) {
+      var first = PROFILE_TABLE[0];
       return { depth: first[1], errorPct: first[2], maxLoss: first[3], blunderPct: first[4] };
     }
-    for (var i = 1; i < STRENGTH_TABLE.length; i++) {
-      var a = STRENGTH_TABLE[i - 1];
-      var b = STRENGTH_TABLE[i];
+    for (var i = 1; i < PROFILE_TABLE.length; i++) {
+      var a = PROFILE_TABLE[i - 1];
+      var b = PROFILE_TABLE[i];
       if (n > b[0]) continue;
       var t = (n - a[0]) / (b[0] - a[0]);
       var depth = Math.round(lerp(a[1], b[1], t));
@@ -309,15 +581,15 @@
         blunderPct: Math.round(lerp(a[4], b[4], t) * 10) / 10
       };
     }
-    var last = STRENGTH_TABLE[STRENGTH_TABLE.length - 1];
+    var last = PROFILE_TABLE[PROFILE_TABLE.length - 1];
     return { depth: 0, errorPct: last[2], maxLoss: last[3], blunderPct: last[4] };
   }
 
   /*
-   * The rating the game should look like. Prefer the player's own rating,
-   * fall back to the opponent's, and aim slightly above the opponent so the
-   * game is winnable while the numbers still fit the account's rating band.
-   * A manual humanizeRating overrides everything.
+   * The rating the game should look like. The account's own rating is the
+   * anchor: this is the level the games have to match, not the opponent's and
+   * not "one band above". The opponent is only used when our own rating could
+   * not be read from the board; a manual humanizeRating overrides everything.
    */
   function targetRating() {
     var manual = clampInt(state.settings.humanizeRating, 0, 3500);
@@ -325,13 +597,9 @@
     var r = state.ratings || {};
     var me = state.myColor === 'b' ? r.b : r.w;
     var them = state.myColor === 'b' ? r.w : r.b;
-    if (!me && !them) return 0;
-    if (!me) return them + 100;
-    var target = me;
-    if (them) target = Math.max(target, them + 100);
-    // Never stray outside the plausible band of this account: at most ~120
-    // above its rating, at most 40 below.
-    return Math.max(me - 40, Math.min(me + 120, target));
+    if (me) return Math.max(400, Math.min(3500, me));
+    if (them) return Math.max(400, Math.min(3500, them));
+    return 0;
   }
 
   /*
@@ -352,6 +620,13 @@
     var chesscomElo = site === 'lichess' ? elo - 200 : elo;
     var mapped = strengthForRating(chesscomElo);
     if (!mapped) return base;
+    // Damage control. The table's *frequency* of mistakes is what makes the
+    // game look like the account's rating, so it stays. The *size* of a single
+    // slip is what gets you mated, and a 320 cp error at bullet speed is a
+    // piece. Cap it, and keep enough depth for a two-move tactic to be seen.
+    mapped.maxLoss = Math.min(mapped.maxLoss, 200);
+    mapped.blunderPct = Math.min(mapped.blunderPct, 5);
+    if (mapped.depth > 0) mapped.depth = Math.max(mapped.depth, 6);
     return mapped;
   }
 
@@ -457,26 +732,143 @@
   }
 
   /*
+   * How much there is to think about here, 0 (obvious) .. 1 (messy).
+   *
+   * Think time that only depends on the clock is a metronome. A real player's
+   * pause tracks the position: a forced recapture is instant on move 5 and on
+   * move 45, while a quiet middlegame with several reasonable moves gets a
+   * real look. The score is built from things the board itself shows —
+   * branching factor, how close the two best moves are, how much material is
+   * left, whether the result is already decided.
+   */
+  /*
+   * Which part of the game this is, named the way a player names it. The site
+   * has no such field and the FEN has no such field, so it is read off the
+   * board: material still on it, queens, and how far the game has gone. The
+   * thresholds are the usual ones - everything down to about an exchange plus
+   * pawns left is an endgame, a full board in the first ten moves is the
+   * opening, everything between is the middlegame.
+   */
+  function gamePhase() {
+    if (!state.game || typeof state.game.board !== 'function') return null;
+    var board = null;
+    try { board = state.game.board(); } catch (e) { return null; }
+    if (!board) return null;
+    var value = { p: 1, n: 3, b: 3, r: 5, q: 9 };
+    var material = 0;
+    var queens = 0;
+    var pieces = 0;
+    for (var r = 0; r < 8; r++) {
+      for (var f = 0; f < 8; f++) {
+        var sq = board[r][f];
+        if (!sq) continue;
+        pieces++;
+        var type = String(sq.type || '').toLowerCase();
+        if (type === 'k') continue;
+        material += value[type] || 0;
+        if (type === 'q') queens++;
+      }
+    }
+    var parts = String(state.fen || '').split(' ');
+    var fullmove = parts.length >= 6 ? (parseInt(parts[5], 10) || 1) : 1;
+    // Seven pieces or fewer is not just an endgame, it is the part with an
+    // exact answer, and saying so is more useful than saying "endgame".
+    if (pieces <= 7) return { key: 'tb', label: 'эндшпиль', short: 'эндшп.' };
+    if (material <= 24 || (queens === 0 && material <= 34)) {
+      return { key: 'end', label: 'эндшпиль', short: 'эндшп.' };
+    }
+    if (fullmove <= 10 && material >= 70) {
+      return { key: 'open', label: 'дебют', short: 'дебют' };
+    }
+    return { key: 'mid', label: 'миттельшпиль', short: 'митт.' };
+  }
+
+  function positionComplexity() {
+    var c = 0.25;
+
+    var legalCount = 0;
+    try {
+      if (state.game && typeof state.game.moves === 'function') {
+        var legal = state.game.moves();
+        legalCount = legal ? legal.length : 0;
+      }
+    } catch (e) { legalCount = 0; }
+    if (legalCount === 1) return 0;
+    if (legalCount > 0) {
+      // 20 legal moves is an ordinary middlegame, 40+ is a wide choice.
+      c += Math.max(-0.2, Math.min(0.3, (legalCount - 22) / 60));
+    }
+
+    if (state.lines && state.lines.length > 1) {
+      var best = lineScoreCp(state.lines[0]);
+      var second = lineScoreCp(state.lines[1]);
+      if (best != null && second != null) {
+        var gap = Math.abs(best - second);
+        // Two moves that are close in eval mean the choice itself is the work.
+        if (gap < 30) c += 0.3;
+        else if (gap < 70) c += 0.2;
+        else if (gap < 150) c += 0.1;
+        else c -= 0.1;
+        // A decided position needs no deliberation about what to do.
+        if (Math.abs(best) >= 400) c -= 0.15;
+        if (Math.abs(best) >= 900) c -= 0.15;
+      }
+    }
+
+    var board = state.prev && state.prev.board;
+    if (board) {
+      var pieces = 0;
+      var queens = 0;
+      for (var i = 0; i < 64; i++) {
+        var p = board[i];
+        if (!p) continue;
+        pieces++;
+        if (p.toLowerCase() === 'q') queens++;
+      }
+      // More pieces, more tactics to check. An endgame is quieter.
+      c += Math.min(0.15, Math.max(0, (pieces - 20) / 60));
+      if (queens >= 2 && pieces >= 16) c += 0.1;
+    }
+
+    // In the first moves there is nothing to calculate yet.
+    if (fullmoveNumber() <= 3) c -= 0.2;
+    return Math.max(0, Math.min(1, c));
+  }
+
+  /*
    * A human does not spend a fixed share of the clock. Most moves take a
    * random time from [min, max], some are quick "obvious" moves and a few are
-   * long thinks. The choice is nudged by the position: a forced move or a
-   * capture is faster, a quiet sharp position takes longer.
+   * long thinks. The window and the shape of the distribution are scaled by
+   * positionComplexity(), so easy positions really are fast and hard ones
+   * really are slow instead of every move sitting in the same band.
    */
   function humanThinkDelay(remainingMs) {
-    var min = clampInt(state.settings.humanizeMinMs, 400, 120000);
-    var max = clampInt(state.settings.humanizeMaxMs, Math.max(500, min), 180000);
-    var rare = clampInt(state.settings.humanizeRareMs, Math.max(1000, max), 240000);
+    var complexity = positionComplexity();
+
+    // The floor is low on purpose: in bullet a human taps a forced move in
+    // 150-200 ms, and anything higher is clock handed to the opponent.
+    var min = clampInt(state.settings.humanizeMinMs, 150, 120000);
+    var max = clampInt(state.settings.humanizeMaxMs, Math.max(250, min), 180000);
+    var rare = clampInt(state.settings.humanizeRareMs, Math.max(400, max), 240000);
     var rarePct = clampInt(state.settings.humanizeRarePct * humanFormFactor(), 0, 60);
     var fastPct = clampInt(state.settings.humanizeFastPct, 0, 70);
-    var fastMax = clampInt(state.settings.humanizeFastMs, 400, 15000);
+    var fastMax = clampInt(state.settings.humanizeFastMs, 160, 15000);
+
+    // A simple position keeps its fast taps; a messy one loses most of them
+    // and stretches the window, because a person actually stops to look.
+    var fastChance = fastPct * (1 - 0.6 * complexity);
+    min *= 1 + 0.5 * complexity;
+    max *= 1 + 0.9 * complexity;
+    rare *= 1 + 0.4 * complexity;
 
     var delay;
-    if (fastPct > 0 && Math.random() * 100 < fastPct) {
+    if (fastChance > 0 && Math.random() * 100 < fastChance) {
       // An obvious recapture or a known line: a human barely stops to think.
-      delay = 350 + Math.random() * Math.max(0, fastMax - 350);
+      delay = 140 + Math.random() * Math.max(0, fastMax - 140);
     } else {
       // Skew towards the lower half: short thinks are common, long ones rare.
-      var t = Math.pow(Math.random(), 1.6);
+      // A complex position flattens the skew, so the tail gets real weight.
+      var t = Math.pow(Math.random(), 1.6 - 0.7 * complexity);
       delay = min + (max - min) * t;
       if (rarePct > 0 && Math.random() * 100 < rarePct) {
         delay = max + Math.random() * Math.max(0, rare - max);
@@ -492,37 +884,33 @@
     } catch (e) { onlyMove = false; }
     var forcing = !!state.bestSan &&
       (state.bestSan.indexOf('x') >= 0 || /[+#]$/.test(state.bestSan));
-    var gap = null;
-    if (state.lines && state.lines.length > 1) {
-      var best = lineScoreCp(state.lines[0]);
-      var second = lineScoreCp(state.lines[1]);
-      if (best != null && second != null) gap = best - second;
-    }
 
     if (onlyMove) {
       // There is nothing to calculate; a human still takes a short beat.
       delay = Math.min(delay, 1400 + Math.random() * 1100);
     } else if (forcing) {
-      delay *= 0.8;
-    } else if (gap != null && gap >= 150) {
-      delay *= 0.75;
-    } else if (gap != null && gap < 40) {
-      delay *= 1.15;
+      delay *= 0.85;
     }
 
     // Continuous jitter means two moves never get exactly the same delay.
     delay *= 0.9 + Math.random() * 0.2;
-    if (state.humanLastDelay > 0 && Math.abs(delay - state.humanLastDelay) < 350) {
-      delay += 350 + Math.random() * 900;
+    // Two similar intervals in a row look scripted, but the correction has to
+    // scale with the interval: in bullet adding a full second is a lost game.
+    if (state.humanLastDelay > 0 && Math.abs(delay - state.humanLastDelay) < 200) {
+      var spread = Math.max(60, Math.min(500, delay * 0.45));
+      delay += spread * (0.4 + Math.random());
     }
-    delay = Math.max(350, delay);
+    delay = Math.max(120, delay);
 
     if (state.settings.humanizeClockAware && remainingMs != null) {
-      var reserve = Math.max(1500, Math.min(8000, remainingMs * 0.06));
-      var usable = Math.max(500, remainingMs - reserve);
-      var share = remainingMs > 60000 ? 0.15 : (remainingMs > 20000 ? 0.10 : 0.06);
-      var cap = Math.max(700, Math.min(usable, remainingMs * share));
-      if (remainingMs <= 4000) cap = Math.max(250, remainingMs * 0.12);
+      // The per-move budget is a fraction of what is left, not a constant: a
+      // fixed 1-2 s per move flags in a 1+0 game long before the position is
+      // lost. The reserve covers the last few moves and the network lag.
+      var reserve = Math.max(2000, Math.min(6000, remainingMs * 0.08));
+      var usable = Math.max(200, remainingMs - reserve);
+      var share = remainingMs > 120000 ? 0.05 :
+                  (remainingMs > 30000 ? 0.04 : 0.03);
+      var cap = Math.max(150, Math.min(usable, remainingMs * share));
       delay = Math.min(delay, cap);
     }
 
@@ -611,6 +999,26 @@
     } else if (topEvalCp != null && topEvalCp > 250) {
       blunderPct *= 0.25;
       pct = Math.round(pct * 0.9);
+    }
+
+    // Time pressure. A human's mistake rate is not constant over the game: it
+    // climbs as the clock runs down. Without this the errors are spread evenly,
+    // which is its own signature — real reviews show the blunders bunched in
+    // the scramble. Below ten seconds the controller stops humanizing at all
+    // (time safety wins), so this covers the 10-45 s band where a person still
+    // has enough time to make a bad decision.
+    if (human) {
+      var clock = null;
+      try { clock = clockState(); } catch (e) { clock = null; }
+      if (clock && clock.mine != null) {
+        var pressure = 0;
+        if (clock.mine <= 20000) pressure = 0.30;
+        else if (clock.mine <= 45000) pressure = 0.12;
+        if (pressure > 0) {
+          pct = Math.min(95, Math.round(pct * (1 + pressure)));
+          blunderPct = Math.min(40, blunderPct * (1 + pressure * 2.2));
+        }
+      }
     }
 
     if (!human || !pct || lines.length < 2 || Math.random() * 100 >= pct) {
@@ -791,6 +1199,9 @@
     state.scoreText = '';
     state.depth = null;
     state.thinking = false;
+    // A tablebase answer belongs to one position, like the search does.
+    state.tbChoice = null;
+    state.tbPending = null;
     // The last search time belongs to the position being left behind.
     state.thinkMs = null;
     state.thinkStart = null;
@@ -806,6 +1217,27 @@
   }
 
   function requestAnalysis() {
+    // Perfect endgame play does not need the search, and it must not wait for
+    // it: the request goes out now and the answer usually beats the engine.
+    requestTablebase();
+    // A single legal move is worth no search at all. This saves the whole
+    // budget on the one move that cannot be improved, and it is the cheapest
+    // clock protection available in bullet.
+    var only = state.settings.enabled && !state.gameOver &&
+      state.myColor && state.turn === state.myColor ? onlyLegalUci() : null;
+    if (only) {
+      state.lastRequestedFen = state.fen;
+      state.thinking = false;
+      state.thinkStart = null;
+      state.thinkMs = 0;
+      state.bestUci = only;
+      state.bestMove = core.uciToMove(only);
+      var forcedSan = core.sanLines(state.fen, [only], 1);
+      state.bestSan = forcedSan[0] || only;
+      render();
+      scheduleAutoMove();
+      return;
+    }
     if (!state.engine || !state.fen || state.gameOver || !state.settings.enabled) return;
     if (state.fen === state.lastRequestedFen) return;
     state.lastRequestedFen = state.fen;
@@ -851,6 +1283,34 @@
     // While the opponent is thinking their clock is running, not ours, so a
     // deeper forecast costs nothing. Keep it above the fast autoplay time.
     if (predicting) movetime = Math.max(movetime, 3000);
+    // Pure engine play has no reason to use a fixed search time. A fixed 5 s is
+    // wasteful in a 10-minute game and ruinous in bullet, so the budget is a
+    // sixtieth of the remaining clock: roughly 60 moves at any control, real
+    // depth in a long game, and no way to flag. The user's own setting stays a
+    // floor, so an explicit 20 s is not silently reduced.
+    //
+    // The slice is then redistributed around that base instead of being spent
+    // flat. A quiet position with a clear best move needs far less than a sharp
+    // one where a single tempo decides the game, so easy moves get ~0.55x and
+    // wide, close-evaluation positions get ~1.3x. This is safe by construction:
+    // the base is always a fraction of what is left, so overspending on a
+    // critical move only shrinks the budgets after it, and the total still
+    // tracks the clock.
+    if (!humanizing && !opponentTurn && !state.rescue) {
+      var myClock = clockRemaining(state.myColor);
+      var base = myClock != null
+        ? clampInt(Math.round(myClock / 60), 300, 30000)
+        : 1500;
+      var complexity = positionComplexity();
+      var factor = 0.55 + 0.9 * complexity;
+      var fair = clampInt(Math.round(base * factor), 200, 30000);
+      if (myClock != null) {
+        // Never hand one move more than a thirty-fifth of the clock, whatever
+        // the position says: a single deep think must not become a flag.
+        fair = Math.min(fair, Math.max(200, Math.round(myClock / 35)));
+      }
+      movetime = Math.max(movetime, fair);
+    }
     // On a low clock, search only the top line and return almost immediately.
     // The anti-flag guard will use any line that already arrived.
     if (state.turn === state.myColor) {
@@ -871,7 +1331,11 @@
       multiPV: multiPV,
       movetime: movetime,
       depth: depth,
-      skill: skill
+      skill: skill,
+      // The legal moves of this position, so the background can hand each
+      // worker its own share of the root and search them in parallel. The
+      // board is the authority on legality, not the engine's copy of it.
+      rootMoves: rootMoveList()
     });
     // If the port is not connected the request never leaves the page. Forget
     // it so the engine-ready handler can ask again after reconnecting.
@@ -926,9 +1390,16 @@
       thinkStart: state.thinkStart,
       engineReady: !!state.engineReady,
       engineLabel: state.engineLabel,
+      engineThreads: state.engineThreads,
       gameOver: !!state.gameOver,
       autoPlay: !!state.settings.autoPlay,
       autoStatus: state.autoStatus,
+      tablebase: tablebaseChip(),
+      tablebaseText: tablebaseText(),
+      tablebaseTone: state.tbChoice && state.tbChoice.fen === state.fen
+        ? tbOutcomeTone(state.tbChoice.category)
+        : 'idle',
+      phase: phaseChip(),
       error: state.error || state.engineError || null,
       site: state.adapter.id
     });
@@ -958,10 +1429,23 @@
       thinking: !!state.thinking,
       engineReady: !!state.engineReady,
       engineLabel: state.engineLabel,
+      engineThreads: state.engineThreads,
       depth: state.depth,
       thinkMs: state.thinkMs,
       score: state.scoreText,
       bestSan: state.bestSan,
+      tablebase: !!state.tbChoice,
+      phase: (function () {
+        var p = gamePhase();
+        return p ? p.label : null;
+      })(),
+      tablebaseLast: state.tbLast ? {
+        category: state.tbLast.category,
+        text: tbOutcomeText(state.tbLast.category),
+        dtz: state.tbLast.dtz,
+        san: state.tbLast.san,
+        count: state.tbHit
+      } : null,
       lines: state.lines.slice(0, 3).map(function (line) {
         return {
           san: line.san,
@@ -974,6 +1458,7 @@
       autoPlay: !!state.settings.autoPlay,
       autoBusy: !!state.autoBusy,
       autoStatus: state.autoStatus,
+      autoRematch: !!state.settings.autoRematch,
       gameOver: !!state.gameOver,
       error: state.error || state.engineError || null
     };
@@ -994,6 +1479,41 @@
     }
   }
 
+  /*
+   * The UCI of the single legal move, or null. A forced move is not a decision:
+   * searching it burns clock for a result that is already known, which matters
+   * most exactly where the clock matters most.
+   */
+  /*
+   * Every legal move here, in UCI, for the background to divide between its
+   * workers. The board is the authority on what is legal, so the engine never
+   * has to be asked. Capped because no position needs more and the message
+   * travels on every move.
+   */
+  function rootMoveList() {
+    if (!state.game || typeof state.game.moves !== 'function') return null;
+    var moves = null;
+    try { moves = state.game.moves({ verbose: true }); } catch (e) { return null; }
+    if (!moves || !moves.length) return null;
+    var out = [];
+    for (var i = 0; i < moves.length && out.length < 40; i++) {
+      var m = moves[i];
+      if (!m || !m.from || !m.to) return null;
+      out.push(String(m.from) + String(m.to) + (m.promotion ? m.promotion : ''));
+    }
+    return out.length ? out : null;
+  }
+
+  function onlyLegalUci() {
+    if (!state.game || typeof state.game.moves !== 'function') return null;
+    var moves = null;
+    try { moves = state.game.moves({ verbose: true }); } catch (e) { return null; }
+    if (!moves || moves.length !== 1) return null;
+    var m = moves[0];
+    if (!m || !m.from || !m.to) return null;
+    return String(m.from) + String(m.to) + (m.promotion ? m.promotion : '');
+  }
+
   function waitForBoardChange(previousBoard, timeoutMs) {
     return new Promise(function (resolve) {
       var started = Date.now();
@@ -1009,6 +1529,167 @@
       }
       check();
     });
+  }
+
+  /* ----------------------------------------------------------- auto rematch */
+
+  /*
+   * chess.com ends a game with a dialog whose main button offers the same time
+   * control again: "Новая 1 мин.", "Новая 3 мин.", "Новая 3+2", "Новая 10
+   * мин.". All of them are rematch offers, so any control is accepted, not
+   * just the bullet one.
+   *
+   * The caption is what identifies the button: the dialog markup and classes
+   * churn between releases, while the caption is the one thing this feature
+   * means. The clock is parsed out of it so that, when the dialog offers
+   * several controls, the one played last keeps being played.
+   */
+  var REMATCH_LABEL =
+    /(?:новая(?:\s+(?:партия|игра|игру))?|сыграть|new(?:\s+game)?)\s*(\d{1,2})(?:\s*\+\s*(\d{1,2}))?\s*(?:мин|min)?/;
+
+  /*
+   * "3 мин." and "3+2" both normalise to a token that can be remembered.
+   * A bare "новая партия" without a clock is not a rematch offer and returns
+   * null, so a generic caption elsewhere on the page cannot be pressed.
+   */
+  function rematchToken(text) {
+    var m = REMATCH_LABEL.exec(text);
+    if (!m) return null;
+    if (m[2] == null && !/мин|min/.test(text)) return null;
+    return m[2] ? m[1] + '+' + m[2] : m[1] + '+0';
+  }
+
+  function rematchButton() {
+    var nodes;
+    try { nodes = document.querySelectorAll('button, [role="button"], a'); }
+    catch (e) { return null; }
+    var best = null;
+    var bestArea = Infinity;
+    var bestToken = null;
+    var bestPreferred = false;
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      var text = (node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!text) continue;
+      var token = rematchToken(text);
+      if (!token) continue;
+      if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
+      var rect = null;
+      try { rect = node.getBoundingClientRect(); } catch (e) { rect = null; }
+      if (!rect || rect.width < 24 || rect.height < 14) continue;
+      // A caption tucked into a collapsed sidebar or below the fold is not the
+      // dialog button; only press what the user could actually see.
+      var vw = window.innerWidth || 0;
+      var vh = window.innerHeight || 0;
+      if (vw && vh && (rect.bottom <= 0 || rect.right <= 0 ||
+          rect.top >= vh || rect.left >= vw)) continue;
+      var style = null;
+      try { style = getComputedStyle(node); } catch (e) { style = null; }
+      if (style && (style.display === 'none' || style.visibility === 'hidden' ||
+          style.opacity === '0' || style.pointerEvents === 'none')) continue;
+      // The control played last outranks a different offer even when the other
+      // button is smaller. Inside the same rank, the smallest match wins: nested
+      // wrappers carry the same caption, and the button is the innermost one.
+      var preferred = !!state.settings.rematchControl &&
+        token === state.settings.rematchControl;
+      var area = rect.width * rect.height;
+      if (best && bestPreferred && !preferred) continue;
+      if (!best || (preferred && !bestPreferred) ||
+          (preferred === bestPreferred && area < bestArea)) {
+        best = node;
+        bestArea = area;
+        bestToken = token;
+        bestPreferred = preferred;
+      }
+    }
+    return best ? { node: best, token: bestToken } : null;
+  }
+
+  /*
+   * Remembered across reloads: without it the first visible offer wins, and a
+   * dialog that reshuffles its buttons could drop a 3-minute player into 1+0.
+   */
+  function rememberRematchControl(token) {
+    if (!token || state.settings.rematchControl === token) return;
+    state.settings.rematchControl = token;
+    try {
+      var result = api.storage.local.set({ rematchControl: token });
+      if (result && typeof result.catch === 'function') result.catch(function () {});
+    } catch (e) { /* the next press simply falls back to any offer */ }
+  }
+
+  /*
+   * A plain .click() is what a real press ends up as, and chess.com handles
+   * it. The pointer sequence is the fallback for the dialogs that only react
+   * to pointerup on the element under the cursor.
+   */
+  function rematchPointer(node) {
+    var rect = null;
+    try { rect = node.getBoundingClientRect(); } catch (e) { rect = null; }
+    if (!rect || !rect.width) return;
+    var x = rect.left + rect.width / 2;
+    var y = rect.top + rect.height / 2;
+    var target = node;
+    try { target = document.elementFromPoint(x, y) || node; } catch (e) { target = node; }
+    var base = {
+      bubbles: true, cancelable: true, composed: true,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      button: 0, buttons: 1, view: window
+    };
+    var pointer = Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, base);
+    function fire(name, init, ctor) {
+      try { target.dispatchEvent(new ctor(name, init)); } catch (e) { /* ignore */ }
+    }
+    fire('pointerdown', pointer, PointerEvent);
+    fire('mousedown', base, MouseEvent);
+    fire('pointerup', Object.assign({}, pointer, { buttons: 0 }), PointerEvent);
+    fire('mouseup', Object.assign({}, base, { buttons: 0 }), MouseEvent);
+    fire('click', Object.assign({}, base, { buttons: 0 }), MouseEvent);
+  }
+
+  function tickRematch() {
+    if (!state.settings.autoRematch) return;
+    var now = Date.now();
+    if (now - state.rematchCheckAt < 800) return;
+    state.rematchCheckAt = now;
+
+    var found = rematchButton();
+    var r = state.rematch;
+
+    if (!found) {
+      // No dialog: a new game started or none was offered. The next result
+      // re-arms from scratch.
+      r.armedAt = 0;
+      r.attempts = 0;
+      return;
+    }
+    var button = found.node;
+
+    if (!r.armedAt) {
+      // Do not jump into the next game the instant the result appears.
+      var pause = 1100 + Math.random() * 2400;
+      // One result in eight gets a real break. A person gets up, looks at the
+      // phone, waits out the "play again" prompt. Starting a game within two
+      // seconds of every single result, for an hour straight, is a pattern.
+      if (Math.random() < 0.12) pause += 6000 + Math.random() * 25000;
+      r.armedAt = now + pause;
+      return;
+    }
+    if (now < r.armedAt) return;
+
+    r.attempts++;
+    if (r.attempts === 1) {
+      // Only a real press teaches the preference; the fallback pick is not
+      // necessarily the control the user wants.
+      rememberRematchControl(found.token);
+      try { button.click(); } catch (e) { rematchPointer(button); }
+      r.armedAt = now + 1500;
+      return;
+    }
+    rematchPointer(button);
+    // Three failed presses mean the dialog does not react to synthetic input;
+    // stop hammering it and try again in half a minute.
+    r.armedAt = r.attempts >= 3 ? now + 30000 : now + 2500;
   }
 
   function scheduleAutoMove() {
@@ -1054,6 +1735,14 @@
       if (delay > 0) state.autoStatus = 'думаю как человек…';
     } else {
       delay = clampInt(state.settings.autoPlayDelayMs, 150, 5000);
+      // A tablebase request for exactly this position is still in flight. It
+      // costs a few hundred milliseconds and upgrades a strong endgame move to
+      // a perfect one, so give it the time when the clock is not tight.
+      if (state.tbPending && state.tbPending.fen === state.fen &&
+          !tablebaseChoiceFor(state.fen)) {
+        var tbLeft = clockRemaining(state.myColor);
+        if (tbLeft == null || tbLeft > 8000) delay = Math.max(delay, 450);
+      }
     }
 
     if (delay <= 30) {
@@ -1182,7 +1871,11 @@
         mode: 'click',
         touch: TOUCH,
         color: state.turn,
-        site: state.adapter.id
+        site: state.adapter.id,
+        // 'events' keeps the move on the board itself (pointer events on the
+        // squares) instead of calling the site's game object. Same move, same
+        // visual result, but it originates where a human's does.
+        input: state.settings.humanInput ? 'events' : 'auto'
       });
       via = attempt && attempt.via ? attempt.via : '';
       var apiMove = via === 'lichess-api' || via === 'lichess-socket' || via === 'chesscom-api';
@@ -1466,6 +2159,13 @@
     state.fen = built.fen;
     state.game = game;
     state.gameOver = isGameOver(game) || !!read.gameOver;
+    // A finished game followed by a live one is a new game: the record of what
+    // the tablebase decided belongs to the old one.
+    if (!state.gameOver && state.tbGameOver) {
+      state.tbLast = null;
+      state.tbHit = 0;
+    }
+    state.tbGameOver = state.gameOver;
     state.clockTurn = read.clockTurn || state.clockTurn || null;
     state.clockDisagreement = 0;
     state.badReads = 0;
@@ -1497,6 +2197,9 @@
       state.scoreText = '';
       state.depth = null;
       state.thinking = false;
+      // The tablebase answer and any request for it belong to the old FEN.
+      state.tbChoice = null;
+      state.tbPending = null;
       state.lastAutoFen = null;
       state.lastAutoKey = null;
       state.autoStatus = '';
@@ -1737,6 +2440,10 @@
     }
     state.wasEnabled = true;
 
+    // Independent of the board: the result dialog can be on screen while the
+    // board is not, and this must keep working with no position to read.
+    tickRematch();
+
     var adapter = CA.sites.detect();
     if (!adapter) return;
     state.adapter = adapter;
@@ -1843,6 +2550,9 @@
     state.engineWasReady = !!msg.ready;
     state.engineReady = !!msg.ready;
     if (msg.engine) state.engineLabel = msg.engine;
+    state.engineThreads = clampInt(
+      msg.parallel != null ? msg.parallel : msg.threads, 1, 8
+    ) || 1;
     if (msg.error) state.engineError = msg.error;
     else if (msg.ready) state.engineError = null;
     // A restarted engine has no search for our position. Ask again unless the
@@ -1876,11 +2586,14 @@
     state.depth = lines[0].depth;
     state.scoreText = lines[0].scoreText;
     // Once a humanized move is chosen for this position, do not let a late
-    // analysis update replace it in the panel/overlay.
-    state.bestSan = state.settings.humanize && state.humanChoice &&
-      state.humanChoice.fen === state.fen
-      ? state.humanChoice.firstSan
-      : lines[0].firstSan;
+    // analysis update replace it in the panel/overlay. A tablebase move wins
+    // over both: it is the exact answer for the position.
+    state.bestSan = tablebaseChoiceFor(state.fen)
+      ? state.tbChoice.firstSan
+      : (state.settings.humanize && state.humanChoice &&
+         state.humanChoice.fen === state.fen
+        ? state.humanChoice.firstSan
+        : lines[0].firstSan);
     if (!state.bestUci) state.bestUci = lines[0].uci;
     state.engineError = null;
     state.thinking = true;
@@ -1953,6 +2666,18 @@
         state.bestSan = sans[0] || msg.uci;
       }
     }
+    // The tablebase outranks the search: it is the exact result of the
+    // position, not an approximation of it. Applied last so a search that
+    // finishes after the request cannot replace a perfect move with a good one.
+    var tbNow = tablebaseChoiceFor(state.fen);
+    if (tbNow) {
+      var tbMove = core.uciToMove(tbNow.uci);
+      if (tbMove && isLegalMove(state.fen, tbMove)) {
+        state.bestUci = tbNow.uci;
+        state.bestMove = tbMove;
+        state.bestSan = tbNow.firstSan;
+      }
+    }
     state.engineError = null;
     render();
     scheduleAutoMove();
@@ -1968,8 +2693,13 @@
       state.settings[key] = changes[key].newValue;
       touched = true;
       if (key === 'multiPV' || key === 'movetimeMs' || key === 'humanize' ||
-          key === 'engineDepth' || key === 'engineSkill' ||
+          key === 'engineDepth' || key === 'engineSkill' || key === 'tablebase' ||
           key === 'humanizeAdaptive' || key === 'humanizeRating') reanalyze = true;
+      if (key === 'tablebase' || key === 'humanize') {
+        state.tbChoice = null;
+        state.tbPending = null;
+        if (key === 'tablebase') state.tbCache = Object.create(null);
+      }
       if (key.indexOf('humanize') === 0) {
         humanTouched = true;
         state.humanChoice = null;

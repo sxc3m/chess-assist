@@ -311,6 +311,50 @@ check('archives store forward-slash entry names', function () {
   assert.ok(build.indexOf('uses a backslash separator') >= 0);
 });
 
+check('auto rematch is wired through the settings page', function () {
+  assert.ok(content.indexOf("autoRematch: false") >= 0);
+  assert.ok(content.indexOf('autoRematch: !!state.settings.autoRematch') >= 0);
+  assert.ok(popupJs.indexOf('autoRematch: false') >= 0);
+  assert.ok(popupJs.indexOf("$('autoRematch').checked") >= 0);
+  assert.ok(popupJs.indexOf("save({ autoRematch: !!event.target.checked })") >= 0);
+  var popupHtml = read('popup/popup.html');
+  assert.ok(popupHtml.indexOf('id="autoRematch"') >= 0);
+});
+
+check('the board-event move path is wired but off by default', function () {
+  // Off by default on purpose: the DOM path depends on the site's markup, and
+  // it is only worth its extra latency once the user asks for it.
+  assert.ok(content.indexOf("humanInput: false") >= 0);
+  assert.ok(popupJs.indexOf("humanInput: false") >= 0);
+  assert.ok(popupJs.indexOf("$('humanInput').checked") >= 0);
+  assert.ok(popupJs.indexOf("save({ humanInput: !!event.target.checked })") >= 0);
+  assert.ok(read('popup/popup.html').indexOf('id="humanInput"') >= 0);
+  // The controller must forward the choice, and the mover must honour it.
+  assert.ok(content.indexOf("state.settings.humanInput ? 'events' : 'auto'") >= 0);
+  assert.ok(read('content/automove.js').indexOf("opts.input !== 'events'") >= 0);
+});
+
+check('auto rematch presses the offer on any time control', function () {
+  assert.ok(content.indexOf('tickRematch()') >= 0);
+  assert.ok(content.indexOf('function rematchButton()') >= 0);
+  // The caption is what identifies the button: chess.com's classes and the
+  // dialog markup change, the caption does not.
+  assert.ok(content.indexOf('var REMATCH_LABEL') >= 0,
+    'the rematch label regex must be present');
+  // content.js lowercases the button caption before matching it.
+  assert.ok(/toLowerCase\(\)/.test(content.slice(content.indexOf('function rematchButton()'))));
+  // 1+0 is no longer the only accepted control: the clock is parsed out of the
+  // caption so every offer on the dialog is usable.
+  assert.ok(content.indexOf('function rematchToken(') >= 0);
+  assert.ok(content.indexOf('rememberRematchControl(found.token)') >= 0);
+  // No win/loss condition anywhere in the rematch module: the same press
+  // runs after a win, a loss, and a draw.
+  var module = content.slice(content.indexOf('function tickRematch()'));
+  module = module.slice(0, module.indexOf('function scheduleAutoMove()'));
+  assert.strictEqual(/win|lose|loss|побед|пораж/i.test(module), false,
+    'the rematch must not branch on the result');
+});
+
 /* ------------------------------------------------------------------- report */
 
 runTouchTests().then(function () {
